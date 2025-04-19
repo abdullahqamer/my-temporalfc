@@ -587,4 +587,4 @@ for cls in clss:
     # torch.save(model.state_dict(), path_dataset_folder+'data/train/'+cls+'TransEmodel-'+method+'-'+str(epochs)+'.pth')
 
 
-# git remote set-url origin2 https://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@github.com/factcheckerr/HybridFC.git
+#git remote set-url origin2 https://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@github.com/factcheckerr/HybridFC.git
