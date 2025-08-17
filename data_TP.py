@@ -7,6 +7,21 @@ import torch
 import os
 
 import random
+
+#my editing ------------
+# allowlist the nn.Embedding class for any weights_only=True load
+# allowlist the nn.Embedding class for any weights_only=True load
+try:
+    torch.serialization.add_safe_globals([
+        torch.nn.modules.sparse.Embedding,
+        torch.nn.Embedding
+    ])
+except AttributeError:
+    # running on a PyTorch version without add_safe_globals; ignore
+    pass
+#my editing ------------
+
+
 class Data:
 
     def __init__(self, args=None):
@@ -15,7 +30,74 @@ class Data:
         emb_typ = args.emb_type
         valid_ratio = args.valid_ratio
         selected_dataset_data_dir = data_dir+str(args.eval_dataset).lower()+"/"
-        tmp_emb_folder = data_dir + str(args.eval_dataset).lower()+"/embeddings/"
+        print(f" [DEBUG] Loading dataset from: {selected_dataset_data_dir}")
+        #tmp_emb_folder = data_dir + str(args.eval_dataset).lower()+"/embeddings/"
+        import os
+        tmp_emb_folder = os.path.join(selected_dataset_data_dir, "embeddings", emb_typ, "")
+
+        def _ensure_id_maps():
+            # Try to load existing maps; otherwise build from raw triples once.
+            maps_exist = all(os.path.exists(selected_dataset_data_dir + f) for f in ["entities", "relations", "times"])
+            if maps_exist:
+                self.idx_ent_dict = self.get_ids_dict(selected_dataset_data_dir + "entities")
+                self.idx_rel_dict = self.get_ids_dict(selected_dataset_data_dir + "relations")
+                self.idx_time_dict = self.get_ids_dict(selected_dataset_data_dir + "times")
+                return
+            # Build maps by scanning raw train/test/valid (URI quintuples)
+            train_raw = self.read_raw_lines(os.path.join(selected_dataset_data_dir + "train/", "train"))
+            valid_raw = self.read_raw_lines(os.path.join(selected_dataset_data_dir + "valid/", "valid"))
+            test_raw = self.read_raw_lines(os.path.join(selected_dataset_data_dir + "test/", "test"))
+            all_raw = train_raw + valid_raw + test_raw
+            self.entities = self.get_entities(all_raw)
+            self.relations = self.get_relations(all_raw)
+            self.times = self.get_times(all_raw)
+
+            def _last(seg):
+                s = seg.strip("<>")
+                return s.rstrip("/").split("/")[-1]
+
+            self.entities = [_last(s) for s, _, o, _, _ in all_raw] + [_last(o) for s, _, o, _, _ in all_raw]
+            self.entities = sorted(set(self.entities))
+
+            self.relations = sorted({_last(p) for _, p, _, _, _ in all_raw})
+
+            # Persist maps
+            with open(selected_dataset_data_dir + "entities", "w") as f:
+                for i,e in enumerate(self.entities): f.write(f"{i} {e}\n")
+            with open(selected_dataset_data_dir + "relations", "w") as f:
+                for i,r in enumerate(self.relations): f.write(f"{i} {r}\n")
+            with open(selected_dataset_data_dir + "times", "w") as f:
+                for i,t in enumerate(self.times): f.write(f"{i} {t}\n")
+            # Reload as dicts in "ID -> index" form
+            self.idx_ent_dict = self.get_ids_dict(selected_dataset_data_dir + "entities")
+            self.idx_rel_dict = self.get_ids_dict(selected_dataset_data_dir + "relations")
+            self.idx_time_dict = self.get_ids_dict(selected_dataset_data_dir + "times")
+
+        def _load_embeddings():
+            # entity.pkl / relation.pkl / time.pkl if present; else CSVs
+            import os
+            def _maybe_pkl(name):
+                p = os.path.join(tmp_emb_folder, name)
+                return os.path.exists(p)
+            if _maybe_pkl("entity.pkl"):
+                self.emb_entities = self.get_embeddings(tmp_emb_folder, "entity.pkl")
+            else:
+                # enforce same order as maps
+                order = [None]*len(self.idx_ent_dict)
+                for iri, idx in self.idx_ent_dict.items():order[idx] = iri
+                self.emb_entities = self.get_embeddings_from_csv(tmp_emb_folder, "all_entities_embeddings_final.csv", order)
+            if _maybe_pkl("relation.pkl"):
+                self.emb_relation = self.get_embeddings(tmp_emb_folder, "relation.pkl")
+            else:
+                order = [None]*len(self.idx_rel_dict)
+                for iri, idx in self.idx_rel_dict.items():order[idx] = iri
+                self.emb_relation = self.get_embeddings_from_csv(tmp_emb_folder, "all_relations_embeddings_final.csv", order)
+            # time embeddings optional
+            self.emb_times = self.get_embeddings(tmp_emb_folder, "time.pkl") if _maybe_pkl("time.pkl") else []
+            self.num_entities = len(self.emb_entities)
+            self.num_relations = len(self.emb_relation)
+            # for range, num_times should come from the time ID map
+            self.num_times = len(self.idx_time_dict)
         #TODO to be deleted and generalized it's logic later
         ids_only = args.ids_only
 
@@ -23,23 +105,60 @@ class Data:
         # Quick workaround as we happen to have duplicate triples.
         # None if load complete data, otherwise load parts of dataset with folders in wrong directory.
         # emb_folder = ""
-        if args.model == "KGE-only":
-            self.process_KGE_only_data(selected_dataset_data_dir, args)
+
+        if args.task == 'range-prediction':
+            _ensure_id_maps()           # <-- maps exist before reading ranges
+            _load_embeddings()          # <-- and embeddings too
+            print("[DEBUG] Loading range-prediction 5-tuple dataset format...")
+
+            #step1: read all files just to get triples
+            #train_raw = self.read_raw_lines(selected_dataset_data_dir + "train/train")
+            #test_raw = self.read_raw_lines(selected_dataset_data_dir + "test/test")
+            #valid_raw = self.read_raw_lines(selected_dataset_data_dir + "valid/valid")
+
+            #step2: extract/entities/relations/times from all splits
+            #self.entities = self.get_entities(train_raw + test_raw + valid_raw)
+            #self.relations = self.get_relations(train_raw + test_raw + valid_raw)
+            #self.times = self.get_times(train_raw + test_raw + valid_raw)
+
+            #step3: build index mapping
+            #self.idx_ent_dict = {e.rsplit("/", 1)[-1]: i for i, e in enumerate(self.entities)}
+            #self.idx_rel_dict = {r.rsplit("/", 1)[-1]: i for i, r in enumerate(self.relations)}
+            #self.idx_time_dict = {str(int(float(t))): i for i, t in enumerate(self.times)}
+
+            #step4: load indexed data
+            self.idx_train_set = self.load_range_data(selected_dataset_data_dir + "train/train")
+            self.idx_test_set = self.load_range_data(selected_dataset_data_dir + "test/test")
+            self.idx_valid_set = self.load_range_data(selected_dataset_data_dir + "valid/valid")
+
+            print(f"[DEBUG] Train entries: {len(self.idx_train_set)}")
+            print(f"[DEBUG] Test entries: {len(self.idx_test_set)}")
+            print(f"[DEBUG] Valid entries: {len(self.idx_valid_set)}")
+
+            '''self.paired_train_idx = self.idx_train_set
+            self.paired_test_idx = self.idx_test_set
+            self.paired_valid_idx = self.idx_valid_set'''
+
+
+        #if args.model == "KGE-only":
+         #   self.process_KGE_only_data(selected_dataset_data_dir, args)
 
         elif ids_only == False:
             self.train_set_time_final = list((self.load_data(selected_dataset_data_dir + "train/", data_type="train")))
             self.test_set_time_final = list((self.load_data(selected_dataset_data_dir + "test/", data_type="test")))
+            self.valid_set_time_final = list((self.load_data(selected_dataset_data_dir + "valid/", data_type="valid")))
 
-            self.test_set_time_final, self.valid_set_time_final = self.generate_test_valid_set(self,
-                                                                                               self.test_set_time_final, valid_ratio)
-            if args.include_veracity == True:
+        #    print(f"Train loaded: {len(self.train_set_time_final)} records")
+        #    print(f"Valid loaded: {len(self.valid_set_time_final)} records")
+        #    print(f"Test loaded: {len(self.test_set_time_final)} records")
+
+            #self.test_set_time_final, self.valid_set_time_final = self.generate_test_valid_set(self,self.test_set_time_final, valid_ratio)
+            #if args.include_veracity == True:
                 # factcheck predictions on train and test data. Should be added here before: 'data_TP/dbpedia124k/factcheck_veracity_scores/train_pred'
-                self.train_set_pred = list((self.load_data(selected_dataset_data_dir + "train/",
-                                        data_type="train_v_scores.txt", pred=True)))
-                self.test_set_pred = list((self.load_data(selected_dataset_data_dir + "test/",
-                                        data_type="test_v_scores.txt", pred=True)))
+             #   self.train_set_pred = list((self.load_data(selected_dataset_data_dir + "train/", data_type="train_v_scores.txt", pred=True)))
+             #   self.test_set_pred = list((self.load_data(selected_dataset_data_dir + "test/", data_type="test_v_scores.txt", pred=True)))
 
-                self.test_set_pred, self.valid_set_pred = self.generate_test_valid_set(self, self.test_set_pred, valid_ratio)
+              #  self.test_set_pred, self.valid_set_pred = self.generate_test_valid_set(self, self.test_set_pred, valid_ratio)
 
             # generate test and validation sets
             # self.test_set, self.valid_set = self.generate_test_valid_set(self, self.test_set)
@@ -49,10 +168,22 @@ class Data:
             ###########################################################################################################
             ##########################################################################################################
             ##################SENTENCE WORLD###########################################################
-
-            self.emb_sentences_train = pd.read_csv(selected_dataset_data_dir + "train/" + "trainSE.csv", sep=",").iloc[:, 3:]
-            self.emb_sentences_test = pd.read_csv(selected_dataset_data_dir + "test/" + "testSE.csv", sep=",").iloc[:, 3:]
-            self.emb_sentences_test, self.emb_sentences_valid = self.generate_test_valid_sentence_set(self, self.emb_sentences_test, valid_ratio)
+            #my editing
+            try:
+                self.emb_sentences_train = pd.read_csv(selected_dataset_data_dir + "train/" + "trainSE.csv", sep=",").iloc[:, 3:]
+            except FileNotFoundError:
+                print("ℹ️  trainSE.csv not found; skipping sentence embeddings.")
+                self.emb_sentences_train = pd.DataFrame()
+            try:
+                self.emb_sentences_test = pd.read_csv(selected_dataset_data_dir + "test/" + "testSE.csv", sep=",").iloc[:, 3:]
+            except FileNotFoundError:
+                print("ℹ️  testSE.csv not found; skipping sentence embeddings.")
+                self.emb_sentences_test = pd.DataFrame()
+            #if you split off a validataion slice of the sentence embeddings:
+            if not self.emb_sentences_test.empty:
+                self.emb_sentences_test, self.emb_sentences_valid = self.generate_test_valid_sentence_set(self, self.emb_sentences_test, valid_ratio)
+            else:
+                self.emb_sentences_valid = pd.DataFrame()
             #############################################################################################################
             ##############################################################################################################
             # get all entities and relations
@@ -65,6 +196,21 @@ class Data:
 
             self.times = self.get_times(self.data)
             self.save_all_resources(self.entities, selected_dataset_data_dir, is_entity=True)
+
+            #--------------- my edititing -----------------
+            # write the entity ID, relation ID, time ID maps
+            # (so that get_ids_dict can load them back in as exact integers)
+            with open(selected_dataset_data_dir + "entities", "w") as f:
+                for idx, ent in enumerate(self.entities):
+                    f.write(f"{idx} {ent}\n")
+            with open(selected_dataset_data_dir + "relations", "w") as f:
+                for idx, rel in enumerate(self.relations):
+                    f.write(f"{idx} {rel}\n")
+            with open(selected_dataset_data_dir + "times", "w") as f:
+                for idx, tim in enumerate(self.times):
+                    f.write(f"{idx} {tim}\n")
+            # --------------- my edititing -----------------
+
             # self.save_all_resources(self.relations, selected_dataset_data_dir, is_entity=False)
             # exit(1)
             self.idx_ent_dict = dict()
@@ -72,12 +218,35 @@ class Data:
             self.idx_time_dict = dict()
 
             # Generate integer mapping
-            for i in self.entities:
-                self.idx_ent_dict[i.replace("<http://dbpedia.org/resource/", "")[:-1]] = len(self.idx_ent_dict)
-            for i in self.relations:
-                self.idx_rel_dict[i.replace("<http://dbpedia.org/ontology/", "")[:-1]] = len(self.idx_rel_dict)
-            for i in self.times:
-                self.idx_time_dict[i] = len(self.idx_time_dict)
+            #for i in self.entities:
+            #    self.idx_ent_dict[i.replace("<http://dbpedia.org/resource/", "")[:-1]] = len(self.idx_ent_dict)
+            #for i in self.relations:
+            #    self.idx_rel_dict[i.replace("<http://dbpedia.org/ontology/", "")[:-1]] = len(self.idx_rel_dict)
+            #for i in self.times:
+            #    self.idx_time_dict[i] = len(self.idx_time_dict)
+
+            #-----------------my editing-----------------
+            for uri in self.entities:
+                s = str(uri)
+                #strip angle brackets if present
+                if s.startswith("<") and s.endswith(">"):
+                    s = s[1:-1]
+                #take the last segment after "/", e.g. "Q112620158" or "Ashok_Bhadra"
+                ent_id = s.rstrip("/").split("/")[-1]
+                self.idx_ent_dict[ent_id] = len(self.idx_ent_dict)
+
+            for uri in self.relations:
+                s = str(uri)
+                if s.startswith("<") and s.endswith(">"):
+                    s = s[1:-1]
+                rel_id = s.rstrip("/").split("/")[-1]
+                self.idx_rel_dict[rel_id] = len(self.idx_rel_dict)
+
+            for t in self.times:
+                #times are already sample (e.g. "1984" or "1984.0")
+                self.idx_time_dict[t] = len(self.idx_time_dict)
+
+            # -----------------my editing-----------------
 
             if args.include_veracity == True:
                 self.copaal_veracity_train = self.get_veracity_data(self, self.train_set_pred)
@@ -95,10 +264,16 @@ class Data:
                                                         'all_relations_embeddings_final.csv')
 
             self.num_entities = len(self.emb_entities)
+            assert len(self.emb_entities) == len(self.idx_ent_dict), "Entity count mismatch"
             self.num_relations = len(self.emb_relation)
             self.num_times = 0
             if str(args.model).__contains__("temporal"):
                 self.num_times = len(self.emb_time)
+
+            #for range prediction we need the count of time buckets, not emb_time
+            if str(args.model).lower() == "range-lstm":
+                self.num_times = len(self.idx_time_dict)
+                print(f"[DEBUG] Override num_times --> {self.num_times} (size of idx_time_dict)")
 
             if args.negative_triple_generation =="corrupted-time-based": # we have to duplicate the sentences because only time is currupted in this case..
                 # TODO for later
@@ -121,16 +296,88 @@ class Data:
                 self.train_set_time_final = self.generate_only_true_triples(self.train_set_time_final)
                 self.valid_set_time_final = self.generate_only_true_triples(self.valid_set_time_final)
                 self.test_set_time_final = self.generate_only_true_triples(self.test_set_time_final)
+
+            #print(f"[DEBUG RAW] first 3 TRAIN quintuples:", self.train_set_time_final[:3])
+            #print(f"[DEBUG RAW] first 3 TEST quintuples:", self.test_set_time_final[:3])
+
+            from collections import defaultdict
+            subject_groups = defaultdict(list)
+            for s, p, o, time, label in self.train_set_time_final:
+                subject_groups[s].append((p, o, time, label))
+            self.train_range_data = []
+            for subj, recs in subject_groups.items():
+                if len(recs) < 2:
+                    continue
+                for i in range(len(recs)):
+                    p1, o1, y1, _ = recs[i]
+                    for j in range(i+1, len(recs)):
+                        _, _, y2, _ = recs[j]
+                        self.train_range_data.append((subj, p1, o1, y1, y2))
+            print(f"[DEBUG] grouped {len(self.train_range_data)}train-range tuples")
+            print(f"[DEBUG] sample:", self.train_range_data[:5])
+
             self.idx_train_set = []
-            i = 0
-            sent_i = 0
-            len_train = len(self.train_set_time_final)
+            for sent_i, (subj, pred, obj, y1, y2) in enumerate(self.train_range_data):
+                # 2.1 clean your URI → just take the final ID
+                s_key = subj.rsplit("/", 1)[-1]
+                p_key = pred.rsplit("/", 1)[-1]
+                o_key = obj.rsplit("/", 1)[-1]
+
+                #2.2 map to your dictionary
+                try:
+                    idx_s = self.idx_ent_dict[s_key]
+                    idx_p = self.idx_rel_dict[p_key]
+                    idx_o = self.idx_ent_dict[o_key]
+                    idx_y1 = self.idx_time_dict[str(y1)]
+                    idx_y2 = self.idx_time_dict[str(y2)]
+                except KeyError as e:
+                    print(f"[DEBUG-OOB] Missing key {e} for pair {(s_key, p_key, o_key, y1, y2)}")
+                    continue
+                #2.3 append exactly two time-indices instead of one
+                self.idx_train_set.append([idx_s, idx_p, idx_o, idx_y1, idx_y2])
+
+            #2.4 sanity-check
+            print(f"[DEBUG] Build {len(self.idx_train_set)} indexed train-range entries")
+            print(f"[DEBUG] sample indexed entries:", self.idx_train_set[:5])
+            #i = 0
+            #sent_i = 0
+            #len_train = len(self.train_set_time_final)
+            """
             for (s, p, o, time, label) in self.train_set_time_final:
-                s = str(s).replace("<http://dbpedia.org/resource/", "")[:-1]
-                p = str(p).replace("<http://dbpedia.org/ontology/", "")[:-1].replace("Of","")
-                o = str(o).replace("<http://dbpedia.org/resource/", "")[:-1]
+                #s = str(s).replace("<http://dbpedia.org/resource/", "")[:-1]
+                #s = str(s).replace("<http://dbpedia.org/resource/", "") \
+                #    .replace("<http://www.wikidata.org/entity/", "") \
+                #    .strip(">")  # Remove trailing ">" safely
+                #p = str(p).replace("<http://dbpedia.org/ontology/", "")[:-1].replace("Of","")
+                #o = str(o).replace("<http://dbpedia.org/resource/", "")[:-1]
+                #o = str(o).replace("<http://dbpedia.org/resource/", "") \
+                #    .replace("<http://www.wikidata.org/entity/", "") \
+                #    .strip(">")  # Remove trailing ">" safely
+
+                # -----------------my editing-----------------
+
+                #subject
+                s = str(s)
+                if s.startswith("<") and s.endswith(">"):
+                    s = s[1:-1]
+                s = s.rstrip("/").split("/")[-1]
+
+                #predicate
+                p = str(p)
+                if p.startswith("<") and p.endswith(">"):
+                    p = p[1:-1]
+                p = p.rstrip("/").split("/")[-1]
+
+                #object
+                o = str(o)
+                if o.startswith("<") and o.endswith(">"):
+                    o = o[1:-1]
+                o = o.rstrip("/").split("/")[-1]
+
+                # -----------------my editing-----------------
+
                 if self.idx_ent_dict.keys().__contains__(s) and self.idx_rel_dict.keys().__contains__(p) and self.idx_ent_dict.keys().__contains__(o):
-                    idx_s, idx_p, idx_o, idx_t,  label = self.idx_ent_dict[s], self.idx_rel_dict[p], self.idx_ent_dict[o], self.idx_time_dict[time], label
+                    idx_s, idx_p, idx_o, idx_t,  label = min(self.idx_ent_dict[s], self.num_entities - 1) , self.idx_rel_dict[p], self.idx_ent_dict[o], self.idx_time_dict[time], label
                     if label == 'True' or label == 1:
                         label = 1
                     else:
@@ -151,16 +398,48 @@ class Data:
                 i = i + 1
                 sent_i = sent_i + 1
 
+                #-----------------------my editing----------------------
+                s_clean = s.replace("<http://dbpedia.org/resource/", "")
+                if s_clean not in self.idx_ent_dict:
+                    print(f"❌ Missing entity in idx_ent_dict: {s_clean}")
+                    raise ValueError("Entity not in embeddings")
+                # -----------------------my editing----------------------
+            """
+
             self.idx_valid_set = []
             j = 0
             sent_i = 0
             len_valid = len(self.valid_set_time_final)
             for (s, p, o, time, label) in self.valid_set_time_final:
-                s = str(s).replace("<http://dbpedia.org/resource/", "")[:-1]
-                p = str(p).replace("<http://dbpedia.org/ontology/", "")[:-1].replace("Of","")
-                o = str(o).replace("<http://dbpedia.org/resource/", "")[:-1]
+
+                #----------------my editing------------------
+
+                #s = str(s).replace("<http://dbpedia.org/resource/", "")[:-1]
+                #p = str(p).replace("<http://dbpedia.org/ontology/", "")[:-1].replace("Of","")
+                #o = str(o).replace("<http://dbpedia.org/resource/", "")[:-1]
+
+                # subject
+                s = str(s)
+                if s.startswith("<") and s.endswith(">"):
+                    s = s[1:-1]
+                s = s.rstrip("/").split("/")[-1]
+
+                # predicate
+                p = str(p)
+                if p.startswith("<") and p.endswith(">"):
+                    p = p[1:-1]
+                p = p.rstrip("/").split("/")[-1]
+
+                # object
+                o = str(o)
+                if o.startswith("<") and o.endswith(">"):
+                    o = o[1:-1]
+                o = o.rstrip("/").split("/")[-1]
+
+                # -----------------my editing-----------------
+
                 if self.idx_ent_dict.keys().__contains__(s) and  self.idx_rel_dict.keys().__contains__(p) and self.idx_ent_dict.keys().__contains__(o):
-                    idx_s, idx_p, idx_o, idx_t, label = self.idx_ent_dict[s], self.idx_rel_dict[p], self.idx_ent_dict[o],self.idx_time_dict[time], label
+                    idx_s, idx_p, idx_o, idx_t, label = min(self.idx_ent_dict[s], self.num_entities - 1) , self.idx_rel_dict[p], self.idx_ent_dict[o],self.idx_time_dict[time], label
                     if label == 'True' or label == 1:
                         label = 1
                     else:
@@ -186,11 +465,35 @@ class Data:
             sent_i = 0
             len_test = len(self.test_set_time_final)
             for (s, p, o, time, label) in self.test_set_time_final:
-                s = str(s).replace("<http://dbpedia.org/resource/", "")[:-1]
-                p = str(p).replace("<http://dbpedia.org/ontology/", "")[:-1].replace("Of","")
-                o = str(o).replace("<http://dbpedia.org/resource/", "")[:-1]
+
+                #---------------my editing----------------
+
+                #s = str(s).replace("<http://dbpedia.org/resource/", "")[:-1]
+                #p = str(p).replace("<http://dbpedia.org/ontology/", "")[:-1].replace("Of","")
+                #o = str(o).replace("<http://dbpedia.org/resource/", "")[:-1]
+
+                # subject
+                s = str(s)
+                if s.startswith("<") and s.endswith(">"):
+                    s = s[1:-1]
+                s = s.rstrip("/").split("/")[-1]
+
+                # predicate
+                p = str(p)
+                if p.startswith("<") and p.endswith(">"):
+                    p = p[1:-1]
+                p = p.rstrip("/").split("/")[-1]
+
+                # object
+                o = str(o)
+                if o.startswith("<") and o.endswith(">"):
+                    o = o[1:-1]
+                o = o.rstrip("/").split("/")[-1]
+
+                # -----------------my editing-----------------
+
                 if self.idx_ent_dict.keys().__contains__(s) and  self.idx_rel_dict.keys().__contains__(p) and self.idx_ent_dict.keys().__contains__(o):
-                    idx_s, idx_p, idx_o, idx_t, label = self.idx_ent_dict[s], self.idx_rel_dict[p], self.idx_ent_dict[o],self.idx_time_dict[time], label
+                    idx_s, idx_p, idx_o, idx_t, label = min(self.idx_ent_dict[s], self.num_entities - 1) , self.idx_rel_dict[p], self.idx_ent_dict[o],self.idx_time_dict[time], label
                     if label == 'True' or label == 1:
                         label = 1
                     else:
@@ -210,21 +513,248 @@ class Data:
                     print("check:" + s + "," + o)
                 k = k + 1
                 sent_i = sent_i + 1
+
+            from collections import Counter
+
+            def dbg_split(name, idx_list):
+                keys = [tuple(rec[:3]) for rec in idx_list]
+                ctr = Counter(keys)
+                total_groups = len(ctr)
+                paired_groups = sum(1 for v in ctr.values() if v >= 2)
+              #  print(f" {name} #records: {len(idx_list)}, #groups: {total_groups}, #with>=2 time-points: {paired_groups}")
+
+            dbg_split("TRAIN", self.idx_train_set)
+            dbg_split("VALID", self.idx_valid_set)
+            dbg_split("TEST", self.idx_test_set)
+
+            from collections import defaultdict
+
+            def dbg_split_by_subject(name, idx_list):
+                print(f"checking {name} set")
+                subject_groups = defaultdict(list)
+                for rec in idx_list:
+                    subject_id = rec[0]
+                    subject_groups[subject_id].append(rec)
+
+                total_groups = len(subject_groups)
+                group_with_2_or_more = sum(1 for grp in subject_groups.values() if len(grp) >= 2)
+
+              #  print(f"{name} #records: {len(idx_list)}, #unique subjects: {total_groups}, #subjects with >= 2 records: {group_with_2_or_more} ")
+
+            dbg_split_by_subject("TRAIN", self.idx_train_set)
+            dbg_split_by_subject("VALID", self.idx_valid_set)
+            dbg_split_by_subject("TEST", self.idx_test_set)
+
+            # ——— STEP: generate paired indices for range‐prediction ———
+            from utils_TP.dataset_classes import make_pairs
+
+            #print(" About to make_pairs on train; #train_idx:", len(self.idx_train_set))
+            self.paired_train_idx = make_pairs(self.idx_train_set)
+            #print(" Made paired_train_idx; length:", len(self.paired_train_idx))
+
+            #print(" about to make_pairs on valid; #valid_idx:", len(self.idx_valid_set))
+            self.paired_valid_idx = make_pairs(self.idx_valid_set)
+            #print(" Made paired_valid_idx; length:", len(self.paired_valid_idx))
+
+            #print(" about to make_pairs on test; #test_idx:", len(self.idx_test_set))
+            self.paired_test_idx = make_pairs(self.idx_test_set)
+            #print(" Made paired_test_idx; length:", len(self.paired_test_idx))
         else:
-            # self.idx_ent_dict = self.get_ids_dict(selected_dataset_data_dir+"entities")
-            # self.idx_rel_dict = self.get_ids_dict(selected_dataset_data_dir+"relations")
-            # self.idx_time_dict = self.get_ids_dict(selected_dataset_data_dir+"times")
-            self.emb_entities = self.get_embeddings( tmp_emb_folder + emb_typ + '/', 'entity.pkl')
-            self.emb_relation = self.get_embeddings( tmp_emb_folder + emb_typ + '/', 'relation.pkl')
-            self.emb_time = self.get_embeddings( tmp_emb_folder + emb_typ + '/', 'time.pkl')
+
+            # --------------- my edititing -----------------
+            self.idx_ent_dict = self.get_ids_dict(selected_dataset_data_dir+"entities")
+            self.idx_rel_dict = self.get_ids_dict(selected_dataset_data_dir+"relations")
+            self.idx_time_dict = self.get_ids_dict(selected_dataset_data_dir+"times")
+
+            _load_embeddings()
+            self.idx_train_set = self.load_id_split(selected_dataset_data_dir + "train/train")
+            self.idx_test_set = self.load_id_split(selected_dataset_data_dir + "test/test")
+            self.idx_valid_set = self.load_id_split(selected_dataset_data_dir + "valid/valid")
+
+
+            # --------------- my edititing -----------------
+
+            #self.emb_entities = self.get_embeddings( tmp_emb_folder + emb_typ + '/', 'entity.pkl')
+            #self.emb_relation = self.get_embeddings( tmp_emb_folder + emb_typ + '/', 'relation.pkl')
+            #self.emb_time = self.get_embeddings( tmp_emb_folder + emb_typ + '/', 'time.pkl')
+
+            import os
+            # ── Entities ───────────────────────────────────────────────────────────
+            ent_pkl = os.path.join(tmp_emb_folder, emb_typ, 'entity.pkl')
+            print("  >> ent_pkl exists? ", os.path.exists(ent_pkl))
+            if os.path.exists(ent_pkl):
+                #self.emb_entities = self.get_embeddings(tmp_emb_folder + emb_typ + '/', 'entity.pkl')
+                #print(f"  >> #mapped entities = {len(self.idx_ent_dict)}, #loaded embeddings = {len(self.emb_entities)}")
+                # load the full embedding (including any reserved tokens)
+                full_ent_emb = self.get_embeddings(tmp_emb_folder + emb_typ + '/', 'entity.pkl')
+            #    print(f" >> #mapped entities = {len(self.idx_ent_dict)}, #loaded embeddings = {len(full_ent_emb)}")
+                # if there are extra rows, assume they’re the first N reserved tokens; drop them:
+                if len(full_ent_emb) > len(self.idx_ent_dict):
+                    extra = len(full_ent_emb) - len(self.idx_ent_dict)
+                    print(f"Trimming off {extra} reserved‐token embeddings")
+                    full_ent_emb = full_ent_emb[extra:]
+                self.emb_entities = full_ent_emb
+            else:
+                # load from CSV and enforce the same order as your mapping
+                ent_order = [None] * len(self.idx_ent_dict)
+                for iri, idx in self.idx_ent_dict.items():
+                    ent_order[idx] = iri
+                self.emb_entities = self.get_embeddings_from_csv(tmp_emb_folder + emb_typ + '/', 'all_entities_embeddings_final.csv', ent_order)
+                print(f"  >> #mapped entities = {len(self.idx_ent_dict)}, #loaded embeddings = {len(self.emb_entities)}")
+
+            # ── Relations ──────────────────────────────────────────────────────────
+            rel_pkl = os.path.join(tmp_emb_folder, emb_typ, 'relation.pkl')
+            if os.path.exists(rel_pkl):
+                self.emb_relation = self.get_embeddings(tmp_emb_folder + emb_typ + '/', 'relation.pkl')
+            else:
+                rel_order = [None] * len(self.idx_rel_dict)
+                for iri, idx in self.idx_rel_dict.items():
+                    rel_order[idx] = iri
+                self.emb_relation = self.get_embeddings_from_csv(tmp_emb_folder + emb_typ + '/', 'all_relations_embeddings_final.csv', rel_order )
+
+            # ── Times ─────────────────────────────────────────────────────────────
+            # if you have a .pkl for times, keep it; otherwise skip or load a CSV
+            time_pkl = os.path.join(tmp_emb_folder, emb_typ, 'time.pkl')
+            if os.path.exists(time_pkl):
+                self.emb_time = self.get_embeddings(tmp_emb_folder + emb_typ + '/', 'time.pkl')
+            else:
+                # if you never use emb_time in range-lstm you can just set it empty
+                self.emb_time = []
+
+            # DEBUG: print out the exact counts
+            #loaded_count = self.emb_entities.shape[0] if hasattr(self.emb_entities, "shape") else len(self.emb_entities)
+            #mapped_count = len(self.idx_ent_dict)
+            #print("Debug ENTITY COUNT")
+            #print(f" -mapped entities (idx_ent_dict): {mapped_count})")
+            #print(f"- loaded entities (idx_ent_dict): {loaded_count}")
+            #print(f" -difference: {loaded_count-mapped_count}")
+            # peek at the first few IDs in your map and the first few embeddings
+            #print(" -sample idx_ent_dict keys:", list(self.idx_ent_dict.keys()) [:5])
+            #if hasattr(self.emb_entities, "shape"):
+            #    print(" -sample emb_entities rows:\n", self.emb_entities[:3])
+
             self.num_entities = len(self.emb_entities)
+            assert len(self.emb_entities) == len(self.idx_ent_dict), "Entity count mismatch"
             self.num_relations = len(self.emb_relation)
             self.num_times = len(self.emb_time)
             self.idx_train_set = self.get_ids_dict(selected_dataset_data_dir+"train/train")
             self.idx_test_set = self.get_ids_dict(selected_dataset_data_dir+"test/test")
-            self.idx_valid_set = self.get_ids_dict(selected_dataset_data_dir+"test/valid")
+            self.idx_valid_set = self.get_ids_dict(selected_dataset_data_dir+"valid/valid")
 
+            # -------------MY EDITITNG-------------------------
+            # ——— DEBUG: check for out-of-bounds IDs in each split ———
+
+            def check_oob(name, triplets, num_ent):
+                # collect all subject & object indices
+                idxs = [t[0] for t in triplets] + [t[2] for t in triplets]
+                if not idxs:
+                    return
+                max_id = max(idxs)
+                if max_id >= num_ent:
+                    missing = sorted({i for i in idxs if i >= num_ent})
+                    print(f"❌ OOB in {name}: max_id={max_id} >= num_entities={num_ent}")
+                    print(f"    sample missing IDs: {missing[:10]}")
+                    raise ValueError(f"Aborting: {name} contains invalid entity IDs.")
+
+            # run checks
+            check_oob("TRAIN", self.idx_train_set, self.num_entities)
+            check_oob("TEST", self.idx_test_set, self.num_entities)
+            check_oob("VALID", self.idx_valid_set, self.num_entities)
+            # ————————————————————————————————————————————————
+            # -------------MY EDITITNG-------------------------
+
+        print(" In Data.__intit__: paired_train_idx exists?", hasattr(self, "paired_train_idx"))
+        print(" paired_valid_idx exists?", hasattr(self, "paired_valid_idx"))
+        print(" paired_test_idx exists?", hasattr(self, "paired_test_idx"))
     # Function to find a key by its value in a dictionary
+
+    def load_id_split(self, file_path):
+        out = []
+        with open(file_path, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) == 5:
+                    out.append(list(map(int, parts)))
+        return out
+
+    def load_range_data(self, file_path):
+        print(f"[DEBUG] Attempting to load range data from {file_path}")
+        raw_lines = self.read_raw_lines(file_path)
+        if not raw_lines:
+            print(f"[WARNING] No data loaded from {file_path}")
+            return []
+
+        idx_data = []
+        for line in raw_lines:
+            try:
+                parts = line.split('\t')  # Assuming tab-separated data
+                if len(parts) != 5:
+                    print(f"[WARNING] Skipping malformed line (expected 5 columns): {line}")
+                    continue
+                h, r, t, y1, y2 = parts
+                h_idx = self.idx_ent_dict.get(h)
+                r_idx = self.idx_rel_dict.get(r)
+                t_idx = self.idx_ent_dict.get(t)
+                y1_idx = self.idx_time_dict.get(str(int(float(y1))))  # Convert to int to match mapping
+                y2_idx = self.idx_time_dict.get(str(int(float(y2))))  # Convert to int to match mapping
+                if None in (h_idx, r_idx, t_idx, y1_idx, y2_idx):
+                    print(
+                        f"[WARNING] Missing index for line: {line} (h_idx={h_idx}, r_idx={r_idx}, t_idx={t_idx}, y1_idx={y1_idx}, y2_idx={y2_idx})")
+                    continue
+                idx_data.append([h_idx, r_idx, t_idx, y1_idx, y2_idx])
+            except Exception as e:
+                print(f"[ERROR] Failed to process line {line}: {e}")
+                continue
+        print(f"[DEBUG] Loaded {len(idx_data)} entries from {file_path}")
+        return idx_data
+
+        ''' dataset = []
+        with open(file_path, 'r') as f:
+            for line in f:
+                parts = line.strip().split('\t')
+                if len(parts) != 5:
+                    print(f"[WARNING] Skipped malformed line: {line.strip()}")
+                    continue
+                s, p, o, y1, y2 = parts
+                # Strip URIs to get entity/relation/time IDs
+                s_id = s.rsplit("/", 1)[-1]
+                p_id = p.rsplit("/", 1)[-1]
+                o_id = o.rsplit("/", 1)[-1]
+
+                try:
+                    s_idx = self.idx_ent_dict[s_id]
+                    p_idx = self.idx_rel_dict[p_id]
+                    o_idx = self.idx_ent_dict[o_id]
+                    y1_idx = self.idx_time_dict[str(int(float(y1)))]
+                    y2_idx = self.idx_time_dict[str(int(float(y2)))]
+                except KeyError:
+                    continue
+
+                dataset.append((s_idx, p_idx, o_idx, y1_idx, y2_idx))
+        print(f" Loaded {len(dataset)} entries from {file_path}")
+        return dataset '''
+
+    def read_raw_lines(self, file_path):
+        if not os.path.exists(file_path):
+            print(f"[ERROR] File not found: {file_path}")
+            return []
+        with open(file_path, 'r') as f:
+            lines = [line.strip() for line in f if line.strip()]
+            print(f"[DEBUG] Read {len(lines)} raw lines from {file_path}")
+            if lines:
+                print(f"[DEBUG] First raw line: {lines[0]}")
+            return lines
+
+        """ raw_data = []
+        with open(file_path, 'r') as f:
+            for line in f:
+                parts = line.strip().split('\t')
+                if len(parts) != 5:
+                    continue
+                s, p, o, y1, y2 = parts
+                raw_data.append((s, p, o, y1, y2))
+        return raw_data """
+
     def process_KGE_only_data(self, selected_dataset_data_dir, args, valid_ratio):
         self.idx_train_set = []
         self.idx_test_set = []
@@ -263,6 +793,7 @@ class Data:
                                                          '/relations_embeddings.csv', self.relations)
 
         self.num_entities = len(self.emb_entities)
+        assert len(self.emb_entities) == len(self.idx_ent_dict), "Entity count mismatch"
         self.num_relations = len(self.emb_relation)
         self.num_times = 0
 
@@ -271,7 +802,7 @@ class Data:
         for (s, p, o, label) in self.train_set:
             if self.idx_ent_dict.keys().__contains__(s) and self.idx_rel_dict.keys().__contains__(
                     p) and self.idx_ent_dict.keys().__contains__(o):
-                idx_s, idx_p, idx_o, label = self.idx_ent_dict[s], self.idx_rel_dict[p], self.idx_ent_dict[o], label
+                idx_s, idx_p, idx_o, label = min(self.idx_ent_dict[s], self.num_entities - 1) , self.idx_rel_dict[p], self.idx_ent_dict[o], label
                 if label == 'True' or label == 1:
                     label = 1
                 else:
@@ -285,7 +816,7 @@ class Data:
         for (s, p, o, label) in self.test_set:
             if self.idx_ent_dict.keys().__contains__(s) and self.idx_rel_dict.keys().__contains__(
                     p) and self.idx_ent_dict.keys().__contains__(o):
-                idx_s, idx_p, idx_o, label = self.idx_ent_dict[s], self.idx_rel_dict[p], self.idx_ent_dict[o], label
+                idx_s, idx_p, idx_o, label = min(self.idx_ent_dict[s], self.num_entities - 1) , self.idx_rel_dict[p], self.idx_ent_dict[o], label
                 if label == 'True' or label == 1:
                     label = 1
                 else:
@@ -299,7 +830,7 @@ class Data:
         for (s, p, o, label) in self.valid_set:
             if self.idx_ent_dict.keys().__contains__(s) and self.idx_rel_dict.keys().__contains__(
                     p) and self.idx_ent_dict.keys().__contains__(o):
-                idx_s, idx_p, idx_o, label = self.idx_ent_dict[s], self.idx_rel_dict[p], self.idx_ent_dict[o], label
+                idx_s, idx_p, idx_o, label = min(self.idx_ent_dict[s], self.num_entities - 1) , self.idx_rel_dict[p], self.idx_ent_dict[o], label
                 if label == 'True' or label == 1:
                     label = 1
                 else:
@@ -310,6 +841,32 @@ class Data:
                 print("check:" + s + "," + o)
             i = i + 1
         print("loading train and test is done")
+
+        # ——— STEP: generate paired indices for range‐prediction ———
+        from utils_TP.dataset_classes import make_pairs
+
+        # -------------MY EDITITNG-------------------------
+        # ——— DEBUG: check for out-of-bounds IDs in each split ———
+
+        def check_oob(name, triplets, num_ent):
+            # collect all subject & object indices
+            idxs = [t[0] for t in triplets] + [t[2] for t in triplets]
+            if not idxs:
+                return
+            max_id = max(idxs)
+            if max_id >= num_ent:
+                missing = sorted({i for i in idxs if i >= num_ent})
+                print(f"❌ OOB in {name}: max_id={max_id} >= num_entities={num_ent}")
+                print(f"    sample missing IDs: {missing[:10]}")
+                raise ValueError(f"Aborting: {name} contains invalid entity IDs.")
+
+        # run checks
+        check_oob("TRAIN", self.idx_train_set, self.num_entities)
+        check_oob("TEST", self.idx_test_set, self.num_entities)
+        check_oob("VALID", self.idx_valid_set, self.num_entities)
+        # ————————————————————————————————————————————————
+        # -------------MY EDITITNG-------------------------
+
 
     def get_key(self,dictionary, value):
         for key, val in dictionary.items():
@@ -473,27 +1030,55 @@ class Data:
         valid_data = test_set.iloc[valid_indices]  # Extract validation set
 
         return test_data, valid_data
+
     def get_ids_dict(self, dict_file_path):
-        ids_dict = dict()
-        data = []
-        with open("%s" % (dict_file_path), "r") as f:
-            for datapoint in f:
-                datapoint = datapoint.split()
-                if len(datapoint) == 2:
-                    ids_dict[datapoint[1]] = datapoint[0]
-                elif len(datapoint)==5:
-                    arr = []
-                    for tt in datapoint:
-                        arr.append(int(tt))
-                    arr.append(True)
-                    data.append(arr)
-                else:
-                    print("invalid format")
-                    exit(1)
-        if len(ids_dict) > 0:
-            return ids_dict
-        else:
-            return data
+        ids_dict = {}
+        with open(dict_file_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) != 2:
+                    continue
+                idx_text, iri = parts
+                try:
+                    idx = int(idx_text)
+                except ValueError:
+                    continue
+                ids_dict[iri] = idx
+        return ids_dict
+    #    ids_dict = dict()
+    #    data = []
+    #    with open("%s" % (dict_file_path), "r") as f:
+    #        for datapoint in f:
+                #datapoint = datapoint.split()
+    #            parts = datapoint.strip().split()
+    #            if len(parts) == 2:
+    #                ids_dict[parts[1]] = int(parts[0])
+                #elif len(datapoint)==5:
+                 #   arr = []
+                  #  for tt in datapoint:
+                   #     arr.append(int(tt))
+                    #arr.append(True)
+                    #data.append(arr)
+    #            elif len(parts) == 5:
+    #                s_iri, p_iri, o_iri, t_str, lbl_str = parts
+                    # look up numeric IDs
+    #                idx_s = self.idx_ent_dict[s_iri]
+    #                idx_p = self.idx_rel_dict[p_iri]
+    #                idx_o = self.idx_ent_dict[o_iri]
+    #                idx_t = self.idx_time_dict[t_str]
+                    # parse label ("True." or "False.")
+    #                lbl = 1 if lbl_str.lower().startswith("true") else 0
+    #                data.append([idx_s, idx_p, idx_o, idx_t, lbl])
+    #            else:
+    #                print("invalid format")
+    #                exit(1)
+    #    if len(ids_dict) > 0:
+    #        return ids_dict
+    #    else:
+    #        return data
     @staticmethod
     def load_data(data_dir, data_type, pred=False):
         try:
@@ -531,7 +1116,7 @@ class Data:
                             else:
                                 s, p, o, time, label = datapoint
                                 label=label.replace("\n","")
-                                assert label == 'True' or label == 'False'
+                                assert label == 'True.' or label == 'False.'         #main code
                                 if label == 'True' or label == '1' or label == 1:
                                     label = 1
                                 else:
@@ -712,30 +1297,65 @@ class Data:
 
     @staticmethod
     def get_times(data):
-        times = sorted(list(set([d[3] for d in data])))
-        return times
+        times = set()
+        for d in data:
+            if len(d) >= 5:
+                for y in (d[3], d[4]):
+                    try:
+                        times.add(str(int(float(y))))
+                    except Exception:
+                        pass
+            else:
+                times.add(str(int(float(d[3]))))
+        #times = sorted(list(set([d[3] for d in data])))
+        return sorted(times)
     # / home / umair / Documents / pythonProjects / HybridFactChecking / Embeddings / ConEx_dbpedia
     @staticmethod
     def get_embeddings_from_csv(path,name, order):
 
         embd = pd.read_csv("%s%s" % (path, name))
 
-        embd['Key'] = pd.Categorical(embd['Key'], categories=order, ordered=True)
+        first_col = embd.columns[0]
+
+        embd['key'] = pd.Categorical(embd[first_col], categories=order, ordered=True)
 
         # Sort the DataFrame based on the 'Fruits' column
-        sorted_df = embd.sort_values(by='Key')
+        sorted_df = embd.sort_values(by="key")
 
-        return sorted_df.iloc[:, 1:]
+        # --- trim any “reserved” embeddings that aren’t in our mapping file ---
+        extra = sorted_df.shape[0] - len(order)
+        if extra > 0:
+            print(f" Trimming off {extra} reserved-token embeddings from CSV")
+            sorted_df = sorted_df.iloc[extra:].reset_index(drop=True)
+
+        #return sorted_df.iloc[:, 1:]
+        return sorted_df.drop([first_col, 'key'], axis=1).reset_index(drop=True)
     @staticmethod
     def get_embeddings(path,name):
         # embeddings = dict()
         # print("%s%s.txt" % (path,name))
         if name.endswith(".pkl"):
-            embd = torch.load("%s%s" % (path,name),map_location=torch.device('cpu'))
-        # old_data = pickle.load(file)
-        # with open("%s%s" % (path,name), 'rb') as f:
-        #     data = pickle.load(f)
-            return embd.weight
+            #my editing -------------------------
+
+            import pickle
+            # 1) Try safe, weights-only load
+            try:
+                emb_obj = torch.load(f"{path}{name}",map_location=torch.device('cpu'),weights_only=True)
+            except (TypeError, pickle.UnpicklingError):
+            # 2) Fallback to full load on trusted files
+                print(f"⚠️  weights_only load failed for {name}; retrying full load")
+                emb_obj = torch.load(f"{path}{name}",map_location=torch.device('cpu'),weights_only=False)
+            # 3) Unwrap if it’s an Embedding module
+            if isinstance(emb_obj, torch.nn.Embedding):
+                embd = emb_obj.weight
+            else:
+            # covers bare Parameter or raw tensor
+                embd = emb_obj
+            #embd = torch.load("%s%s" % (path,name),map_location=torch.device('cpu'))
+            # old_data = pickle.load(file)
+            # with open("%s%s" % (path,name), 'rb') as f:
+            #   data = pickle.load(f)
+            return embd
         elif name.endswith(".csv"):
             embd = pd.read_csv("%s%s" % (path,name), sep=",")
             last_column_name = embd.columns[-1]
@@ -1246,9 +1866,7 @@ class Data:
         #             i = i + 1
         #             break
         if (len(embeddings_valid)!= len(valid_set)) and (len(embeddings_test)!= len(test_set)):
-            print("check lengths of valid and test data:valid_emb:"+str(len(embeddings_valid))+
-                  " valid_set"+str(len(valid_set))+
-                  "test_set:"+str(len(test_set))+"test_emb:"+str(len(embeddings_test)))
+            print("check lengths of valid and test data:valid_emb:"+str(len(embeddings_valid))+" valid_set"+str(len(valid_set))+"test_set:"+str(len(test_set))+"test_emb:"+str(len(embeddings_test)))
             # exit(1)
         train_i = 0
         test_set_copy = deepcopy(test_set)

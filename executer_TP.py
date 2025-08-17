@@ -30,6 +30,8 @@ class Execute_TP:
         self.args = args
         # 1. Create an instance of KG.
         self.args.dataset = Data(args=args)
+        print(f"[DEBUG] idx_time_dict keys: {list(self.args.dataset.idx_time_dict.keys())[:10]}")  # Print first 10 keys
+        self.args.idx_time_dict = self.args.dataset.idx_time_dict  # Add this line to store the dictionary
 
         # 2. Create a storage path  + Serialize dataset object.
         self.storage_path = create_experiment_folder(folder_name=args.storage_path)
@@ -69,13 +71,17 @@ class Execute_TP:
         Train and/or Evaluate Model
         Store Mode
         """
+        print("Training Started...")    # my editing for checking where my code gets killed?
         start_time = time.time()
         # 1. Train and Evaluate
         trained_model = self.train_and_eval()
+        print("Training and evaluation Complete.")      # my editing for checking where my code gets killed?
         # 2. Store trained model
         self.store(trained_model)
         #
         total_runtime = time.time() - start_time
+
+        print(f"Total Runtime: {total_runtime} seconds")        # my editing for checking where my code gets killed?
 
         if 60 * 60 > total_runtime:
             message = f'{total_runtime / 60:.3f} minutes'
@@ -88,6 +94,8 @@ class Execute_TP:
         """
         Training and evaluation procedure
         """
+        print("Training and evaluation Started...")         # my editing for checking where my code gets killed?
+
         self.logger.info('--- Parameters are parsed for training ---')
 
 
@@ -104,13 +112,13 @@ class Execute_TP:
 
         # saves a checkpint model file like: my/path/sample-mnist-epoch=02-val_loss=0.32.ckpt
         checkpoint = ModelCheckpoint(
-            monitor="avg_val_loss_per_epoch",
+            monitor="val_loss",
             dirpath=self.storage_path,
             filename="sample-{"+(str(mdl).lower())+"}--{"+(str(pth).lower())+"}--"+(str(self.args.emb_type).lower())+"--"+(str(self.args.negative_triple_generation).lower())+"--{epoch:02d}-{val_loss:.3f}",
             save_top_k=1,
             mode="min",
         )
-        early_stopping_callback = EarlyStopping(monitor="avg_val_loss_per_epoch", patience=10)
+        early_stopping_callback = EarlyStopping(monitor="val_loss", patience=10)
         # 1. Create Pytorch-lightning Trainer object from input configuration
         # print(torch.cuda.device_count())
         if torch.cuda.is_available():
@@ -120,8 +128,9 @@ class Execute_TP:
             self.trainer = pl.Trainer.from_argparse_args(self.args,
                                                      callbacks = [early_stopping_callback, checkpoint])
         # 2. Check whether validation and test datasets are available.
-        if self.args.dataset.is_valid_test_available():
-            trained_model = self.training()
+        #if self.args.dataset.is_valid_test_available():
+        trained_model = self.training()
+        print("Training fininshed")         # my editing for checking where my code gets killed?
         self.logger.info('--- Training is completed  ---')
 
         # print(self.args.checkpoint_callback.best_model_path)
@@ -134,6 +143,8 @@ class Execute_TP:
         :return:
         """
         # 1. Select model and labelling : triple prediction.
+        print("Loading data")       # my editing for checking where my code gets killed?
+
         model, form_of_labelling = select_model(self.args)
         if not self.args.batch_size:
             self.args.batch_size = int(len(self.args.dataset.idx_train_set) / 3) + 1
@@ -145,6 +156,10 @@ class Execute_TP:
         self.args.deterministic=True
 
         self.logger.info(f' Standard training starts: {model.name}-labeling:{form_of_labelling}')
+
+        print("  >> #valid triples:", len(self.args.dataset.idx_valid_set))
+
+      #  print(" Execute_TP sees dataset.paired_train_idx", getattr(self.args.dataset, "paired_train_idx", None))
         # 2. Create training data.
         dataset = StandardDataModule(train_set_idx=self.args.dataset.idx_train_set,
                                      valid_set_idx=self.args.dataset.idx_valid_set,
@@ -156,11 +171,18 @@ class Execute_TP:
                                      batch_size=self.args.batch_size,
                                      num_workers=self.args.num_workers)
 
+        print("Data loaded successfully")       # my editing for checking where my code gets killed?
+
         # 3. Display the selected model's architecture.
         self.logger.info(model)
 
         train_data = dataset.train_dataloader(batch_size1=self.args.batch_size)
+        batch = next(iter(train_data))
+        print(f"[DEBUG] range batch sampe:", batch)
         val_data = dataset.val_dataloader(batch_size1=self.args.val_batch_size)
+
+     #   print(f"Training Data Size: {len(train_data.dataset)}")         # my editing for checking where my code gets killed?
+     #   print(f"Validation Data Size: {len(val_data.dataset)}")         # my editing for checking where my code gets killed?
 
         # Create a KFoldCrossValidator instance
         # validator = KFoldCrossValidator(model, train_data, val_data, k=5)
@@ -168,9 +190,89 @@ class Execute_TP:
         # 5. Train model
         self.trainer.fit(model, train_data,val_data)
         # 6. Test model on validation and test sets if possible.
-        self.trainer.test(ckpt_path='best',test_dataloaders=dataset.dataloaders(len(self.args.dataset.idx_test_set)))
-        self.evaluate(model, dataset.train_set_idx, 'Evaluation of Train data: ' + form_of_labelling)
-        self.evaluate(model, dataset.test_set_idx, 'Evaluation of Test data: '+ form_of_labelling)
+        #if self.args.task != 'range-prediction':
+        #self.trainer.test(ckpt_path='best',test_dataloaders=dataset.dataloaders(len(self.args.dataset.idx_test_set)))
+        test_results = self.trainer.test(ckpt_path='best',
+                                         dataloaders=dataset.dataloaders(len(self.args.dataset.idx_test_set)))
+        test_loss = float(test_results[0].get("test_loss", float("nan")))
+        #self.evaluate(model, dataset.train_set_idx, 'Evaluation of Train data: ' + form_of_labelling)
+        #self.evaluate(model, dataset.test_set_idx, 'Evaluation of Test data: ' + form_of_labelling)
+        if self.args.task == 'range-prediction':
+            train_metrics = self.evaluate(model, self.args.dataset.idx_train_set, 'Evaluation of Train data: ' + form_of_labelling)
+            test_metrics  = self.evaluate(model, self.args.dataset.idx_test_set, 'Evaluation of Test data: '+ form_of_labelling)
+
+            #FOR PUTTING EVERYTHING IN THE CSV file
+            # Also log best val/test losses if you want
+            # You can read the last logged values from self.trainer.callback_metrics if needed
+            from pathlib import Path, PurePath
+            import csv, datetime
+
+            results_path = Path(self.storage_path) / "results.csv"
+            header = [
+                "timestamp", "run_folder", "preset", "loss_type", "huber_beta", "use_interaction",
+                "order_penalty_lambda", "embedding_dim", "batch_size", "lr",
+                "val_loss_best", "test_loss",
+                "train_exact_match", "train_mae_start", "train_mae_end",
+                "test_exact_match", "test_mae_start", "test_mae_end"
+            ]
+
+            # pull some values
+            ts = datetime.datetime.now().isoformat(timespec="seconds")
+            run_folder = self.storage_path
+            loss_type = getattr(self.args, "loss_type", "l1")
+            huber_beta = getattr(self.args, "huber_beta", 0.5)
+            use_interaction = getattr(self.args, "use_interaction", False)
+            order_penalty_lambda = getattr(self.args, "order_penalty_lambda", 0.0)
+            embedding_dim = self.args.embedding_dim
+            batch_size = self.args.batch_size
+            lr = 1e-3  # or read from model if you prefer
+
+            # read from checkpoint filename or callback metrics if available
+            #val_loss_best = float(self.trainer.callback_metrics.get("val_loss", torch.tensor(float('nan'))))
+            #val_loss_best = float(self.trainer.callback_metrics.get("val_loss", torch.tensor(float("nan"))))
+            # After self.trainer.test(...), test loss is in self.trainer.callback_metrics as well
+            #test_loss = float(self.trainer.callback_metrics.get("test_loss", torch.tensor(float('nan'))))
+
+           # row = [
+            #    ts, run_folder, loss_type, huber_beta, use_interaction,
+            #    order_penalty_lambda, embedding_dim, batch_size, lr,
+            #    val_loss_best, test_loss,
+           #     train_metrics["exact_match"], train_metrics["mae_start_years"], train_metrics["mae_end_years"],
+            #    test_metrics["exact_match"], test_metrics["mae_start_years"], test_metrics["mae_end_years"],
+           # ]
+
+            # best val_loss from checkpoint callback (more accurate than last logged)
+            best_val = None
+            for cb in self.trainer.callbacks:
+                if hasattr(cb, "best_model_score") and cb.best_model_score is not None:
+                    best_val = cb.best_model_score
+            val_loss_best = float(best_val.item()) if best_val is not None else float("nan")
+# test_loss was captured earlier from self.trainer.test() return value
+# already stored in `test_loss` variable
+
+# pull actual learning rate from model (default fallback if missing)
+            lr = getattr(model, "lr", 1e-4)
+# optional: preset label for convenience
+            preset = f"{loss_type}_{'int' if use_interaction else 'base'}"
+
+            row = [
+                ts, run_folder, preset, loss_type, huber_beta, use_interaction,
+                order_penalty_lambda, embedding_dim, batch_size, lr,
+                val_loss_best, test_loss,
+                train_metrics["exact_match"], train_metrics["mae_start_years"], train_metrics["mae_end_years"],
+                test_metrics["exact_match"], test_metrics["mae_start_years"], test_metrics["mae_end_years"],
+            ]
+            file_exists = results_path.exists()
+            with open(results_path, "a", newline="") as f:
+                w = csv.writer(f)
+                if not file_exists:
+                    w.writerow(header)
+                w.writerow(row)
+            # FOR PUTTING EVERYTHING IN THE CSV file
+
+        else:
+            self.evaluate(model, self.args.dataset.idx_train_set, 'Evaluation of Train data: ' + form_of_labelling)
+            self.evaluate(model, self.args.dataset.idx_test_set, 'Evaluation of Test data: '+ form_of_labelling)
         return model
 
     def mrr_score2(self, predictions, labels):
@@ -210,11 +312,13 @@ class Execute_TP:
 
         return np.mean(ranks)
     def evaluate(self, model, triple_idx, info):
+        dev = next(model.parameters()).device
         print("evaluation")
         model.eval()
         self.logger.info(info)
-        self.logger.info(f'Num of triples {len(triple_idx)}')
-
+        #self.logger.info(f'Num of triples {len(triple_idx)}')
+        self.logger.info(f'Num of records {len(triple_idx)}')
+        """
         X_test = np.array(triple_idx)[:, :6]
         y_test = np.array(triple_idx)[:, -1]
 
@@ -228,10 +332,50 @@ class Execute_TP:
             prob = model.forward_triples(idx_s, idx_p, idx_o, t_idx, s_idx, v_data,type="test")
         else:
             prob = model.forward_triples(idx_s, idx_p, idx_o, t_idx, s_idx, v_data)
+        """
+        #load into a single tensor
+        X = np.array(triple_idx)
+        X_tensor = torch.LongTensor(X)
+        if self.args.task == 'range-prediction':
+            #5 column input: (h, r, t, y1, y2)
+            print(f"[DEBUG] eval input shape (Nx5): {X_tensor.shape}")
+            idx_s, idx_p, idx_o, y1_idx, y2_idx = (X_tensor[:, i] for i in range(5))
+            prob = model.forward_triples(idx_s, idx_p, idx_o, y1_idx, y2_idx, type="test" if "Test" in info else None)
+            start_pred, end_pred = prob
+            pred_start = start_pred.round().long().clamp(min=0, max=self.args.num_times-1)
+            pred_end = end_pred.round().long().clamp(min=0, max=self.args.num_times - 1)
+            correct = ((pred_start == y1_idx) & (pred_end == y2_idx)).float().mean()
+            print(f"[INFO] Eval {info!r} exact-match accuracy: {correct*100:.2f}%")
+
+            # Add MAE in years
+            y1_years = torch.tensor([float(model.year_idx_dict[int(i.item())]) for i in y1_idx], device=dev)
+            y2_years = torch.tensor([float(model.year_idx_dict[int(i.item())]) for i in y2_idx], device=dev)
+
+            pred_start_years = torch.tensor([float(model.year_idx_dict[int(p.item())]) for p in pred_start],
+                                            device=dev)
+            pred_end_years = torch.tensor([float(model.year_idx_dict[int(p.item())]) for p in pred_end],
+                                          device=dev)
+            mae_start = torch.abs(pred_start_years - y1_years).float().mean()
+            mae_end = torch.abs(pred_end_years - y2_years).float().mean()
+            print(f"[INFO] Eval {info!r} MAE (start year): {mae_start:.2f} years")
+            print(f"[INFO] Eval {info!r} MAE (end year): {mae_end:.2f} years")
+            # 🔙 return a dict so callers can log it
+            return {
+                "exact_match": float((correct * 100.0).item()),
+                "mae_start_years": float(mae_start.item()),
+                "mae_end_years": float(mae_end.item()),
+            }
+        else:
+            #original 6 column path: (h, r, t, time, sent_idx, veracity)
+            X6 = X_tensor[:, :6]
+            #y = torch.LongTensor(X[:, -1]).long()
+            idx_s, idx_p, idx_o, t_idx, s_idx, v_data = (X6[:, i] for i in range(6))
+            prob = model.forward_triples(idx_s, idx_p, idx_o, t_idx, s_idx, v_data, type="test" if "Test" in info else None)
         # pred = (prob > 0.5).float()
-        pred = prob.data.detach().numpy()
-        max_pred = np.argmax(pred, axis=1)
-        idx, sort_pred= torch.sort(prob,dim=1,descending=True)
+            pred = prob.data.detach().numpy()
+            max_pred = np.argmax(pred, axis=1)
+            idx, sort_pred= torch.sort(prob,dim=1,descending=True)
+            return None
 
         # test_mrr = self.mrr_score(label, sort_pred)
         # self.logger.info(test_mrr)
@@ -240,4 +384,3 @@ class Execute_TP:
 
 
 # true negatives are ignored
-# fa
