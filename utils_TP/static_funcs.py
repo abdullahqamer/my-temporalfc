@@ -19,6 +19,10 @@ from nn_models_TP.text_KGE_hybrid_model import TextKGEHybridModel
 from nn_models_TP.text_model import TextModel
 from nn_models_TP.text_path_hybrid_model import TextPathHybridModel
 
+from nn_models_TP.range_lstm_model import RangeLSTMModel
+
+
+
 
 def calculate_wilcoxen_score(df_data , typ):
     stats.probplot(df_data["emb-only"], dist="norm", plot=plt)
@@ -58,8 +62,11 @@ def remove_punctuations(s):
 # Function to check if a string contains alphabetic characters (potential string)
 def is_alphabetic_string(s):
     if s.startswith("<") and s.endswith(">"):
-        s = remove_punctuations(s) #s[1:-1].replace(":","").replace("/","").replace(".","").replace(",","").replace("_","").replace("-","")
-    return s.isalpha()
+        #s = remove_punctuations(s) s[1:-1].replace(":","").replace("/","").replace(".","").replace(",","").replace("_","").replace("-","")
+        s = s[1:-1]
+    # remove *all* punctuation (so URIs like http://… become alphanumeric)
+    s = remove_punctuations(s)
+    return s.isalnum()          #changed it to isallnum() it was is isalpha()
 
 # Function to analyze the file
 def is_numeric(file_path):
@@ -112,12 +119,24 @@ def sanity_checking_with_arguments(args):
                 print(f'For fact-checkingl task you must specify a negative triple generation method!')
                 raise
         elif str(args.task).lower() == "time-prediction":
+            allowed = {'temporal-prediction-model', 'temporal-lstm'}
+            if str(args.model).lower() not in allowed:
+                print(
+                    f"For time-prediction task you must choose one of {allowed}.\n"
+                    f"You passed: {args.model}"
+                )
+                raise AssertionError
+            #try:
+             #   assert args.model == "temporal_lstm"
+            #except AssertionError:
+             #   print(f'For time-prediction task you can chose the temporal-prediction-model only!!')
+              #  raise
+        elif str(args.task).lower() == "range-prediction":
             try:
-                assert args.model == "temporal-prediction-model"
+                assert args.model == "range-mlp"
             except AssertionError:
-                print(f'For time-prediction task you can chose the temporal-prediction-model only!!')
+                print(f'For range-prediction task you must chose the range-mlp model only!')
                 raise
-
         else:
             assert False
 
@@ -178,7 +197,8 @@ def sanity_checking_with_arguments(args):
 
 
     except AssertionError:
-        print(f'The path does not direct to a file/folder {args.path_train_dataset}')
+        print(args)
+        print(f'The path does not direct to a file/folder {args.path_train_dataset}{args.eval_dataset}')
         raise
     # check for files here
     # try:
@@ -242,7 +262,50 @@ def select_model(args) -> Tuple[pl.LightningModule, AnyStr]:
     elif str(args.model).lower() == 'kge-path-hybrid':
         form_of_labelling = 'FactChecking'
         model = PathKGEHybridModel(args=args)
+    elif str(args.model).lower() == 'temporal-lstm':
+        form_of_labelling = 'TimePrediction'
+        from nn_models_TP.temporal_lstm_model import TemporalLSTMModel
+        model = TemporalLSTMModel(
+            num_entities=args.num_entities,
+            num_relations=args.num_relations,
+            num_times=args.num_times,
+            embedding_dim=args.embedding_dim,
+            lstm_hidden_dim=getattr(args, 'lstm_hidden_dim', 128),
+            num_layers=getattr(args, 'num_layers', 1),
+            dropout=getattr(args, 'dropout', 0.2),
+            lr=getattr(args, 'learning_rate', 1e-3),
+        )
+    elif str(args.model).lower() == 'range-lstm':
+        print(f"[DEBUG] Instantiating RangeLSTMModel with params:", args.num_entities, args.num_relations, args.num_times, args.embedding_dim)
+        from nn_models_TP.range_lstm_model import RangeLSTMModel
+        model = RangeLSTMModel(
+            num_entities=args.num_entities,
+            num_relations=args.num_relations,
+            num_times=args.num_times,
+            embedding_dim=args.embedding_dim,
+            lstm_hidden_dim=getattr(args, 'lstm_hidden_dim', 128),
+            num_layers=getattr(args, 'num_layers', 1),
+            dropout=getattr(args, 'dropout', 0.2),
+            lr=getattr(args, 'learning_rate', 1e-3),
+        )
+        form_of_labelling = 'RangePrediction'
 
+    elif str(args.model).lower() == 'range-mlp':
+        from nn_models_TP.range_mlp_model import RangeMLPModel
+        model = RangeMLPModel(
+            num_entities=args.num_entities,
+            num_relations=args.num_relations,
+            num_times=args.num_times,
+            embedding_dim=args.embedding_dim,
+            idx_time_dict=args.dataset.idx_time_dict,
+            use_interaction=args.use_interaction,
+            loss_type=args.loss_type,
+            huber_beta=args.huber_beta,
+            hidden_dim=256,
+            dropout=0.3,
+            lr=1e-3
+        )
+        form_of_labelling = 'RangePrediction'
     else:
         raise ValueError
     return model, form_of_labelling

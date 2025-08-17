@@ -90,6 +90,7 @@ class TemporalPredictionModel(BaseKGE):
     def forward_triples(self, e1_idx, rel_idx, e2_idx, tim_idx, sen_idx, v_data, type="training"):
     #
     # def forward_triples(self, e1_idx, rel_idx, e2_idx,t_idx, v_idx="", type="training"):
+        print("Forward Pass Started...")            # my editing for checking where my code gets killed?
         emb_head_real = self.entity_embeddings(e1_idx)
         emb_rel_real = self.relation_embeddings(rel_idx)
         emb_tail_real = self.entity_embeddings(e2_idx)
@@ -102,7 +103,13 @@ class TemporalPredictionModel(BaseKGE):
         #     ver_score = self.veracity_score_valid(v_idx)
         # else:
         #     ver_score = self.veracity_score_test(v_idx)
+
+        print(f"Entity Embeddings Shape: {emb_head_real.shape}, {emb_rel_real.shape}, {emb_tail_real.shape}")      # my editing for checking where my code gets killed?
         x = torch.cat([emb_head_real, emb_rel_real, emb_tail_real], 1)
+
+        print(f"Concatenated Input Shape: {x.shape}")       # my editing for checking where my code gets killed?
         x2 = self.shallom(x)
         # x3 = torch.softmax(x2, dim=0)
+
+        print(f"After Passing through Shallom (Linear + Dropout + BatchNorm): {x2.shape}")          # my editing for checking where my code gets killed?
         return x2
