@@ -17,6 +17,9 @@ class RangeMLPModel(pl.LightningModule):
                  use_interaction=False,
                  loss_type="l1",
                  huber_beta=0.5,
+                 use_prod=False,
+                 end_weight=1.0,
+                 extra_order_pen=0.0,
                  ):
         super().__init__()
         self.name = 'RangeMLP'
@@ -36,6 +39,9 @@ class RangeMLPModel(pl.LightningModule):
         self.lr = lr
         self.order_penalty_lambda = order_penalty_lambda
         self.use_interaction = use_interaction
+        self.use_prod = use_prod
+        self.end_weight = float(end_weight)
+        self.extra_order_pen = float(extra_order_pen)
         self.loss_type = loss_type
         self.huber_beta = huber_beta
 
@@ -49,7 +55,11 @@ class RangeMLPModel(pl.LightningModule):
 
         # MLP layers
         #self.fc1 = nn.Linear(embedding_dim * 3, 512)
-        in_feats = embedding_dim * (4 if use_interaction else 3)
+        parts = 3  # [h, r, t]
+        if self.use_interaction: parts += 1  # |h - t|
+        if self.use_prod:        parts += 1  # h ⊙ r
+        in_feats = embedding_dim * parts
+        #in_feats = embedding_dim * (4 if use_interaction else 3)
         self.fc1 = nn.Linear(in_feats, 512)
         self.fc2 = nn.Linear(512, 256)
         self.fc3 = nn.Linear(256, 128)
@@ -88,10 +98,19 @@ class RangeMLPModel(pl.LightningModule):
 
         #x = torch.cat([h, r, t], dim=1)
         #x = torch.cat([h, r, t, torch.abs(h - t)], dim=1)
+
+        #if self.use_interaction:
+        #    x = torch.cat([h, r, t, torch.abs(h - t)], dim=1)
+        #else:
+        #    x = torch.cat([h, r, t], dim=1)
+
+        feats = [h, r, t]
         if self.use_interaction:
-            x = torch.cat([h, r, t, torch.abs(h - t)], dim=1)
-        else:
-            x = torch.cat([h, r, t], dim=1)
+            feats.append(torch.abs(h - t))  # |h - t|
+        if self.use_prod:
+            feats.append(h * r)  # h ⊙ r
+
+        x = torch.cat(feats, dim=1)
 
         x = F.relu(self.fc1(x))
         x = self.dropout(x)
@@ -118,11 +137,20 @@ class RangeMLPModel(pl.LightningModule):
         y1_norm = self._to_norm(y1_idx.float())
         y2_norm = self._to_norm(y2_idx.float())
 
-        loss = self.loss_fn(start_norm, y1_norm) + self.loss_fn(end_norm, y2_norm)
+        #loss = self.loss_fn(start_norm, y1_norm) + self.loss_fn(end_norm, y2_norm)
+
+        # base loss (L1 or Huber is already selected in self.loss_fn)
+        loss = self.loss_fn(start_norm, y1_norm) + self.end_weight * self.loss_fn(end_norm, y2_norm)
 
         # Extra order penalty (should be redundant thanks to monotonic end, but harmless)
-        if self.order_penalty_lambda > 0:
-            loss = loss + self.order_penalty_lambda * F.relu(start_norm - end_norm).mean()
+        #if self.order_penalty_lambda > 0:
+        #    loss = loss + self.order_penalty_lambda * F.relu(start_norm - end_norm).mean()
+
+        # extra order penalty (on top of monotonic head; set extra_order_pen > 0.0 to use)
+        if self.extra_order_pen > 0.0:
+            order_pen = torch.relu(start_norm - end_norm).mean()
+            loss = loss + self.extra_order_pen * order_pen
+
         return loss, start_norm, end_norm, y1_norm, y2_norm
 
     def training_step(self, batch, batch_idx):

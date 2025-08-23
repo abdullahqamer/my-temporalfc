@@ -101,8 +101,11 @@ if __name__ == '__main__':
     # args.huber_beta = 0.5  # (ignored for L1)
 
     # --- B: L1 + |h-t| ---
-    #args.loss_type = "l1"
-    #args.use_interaction = True
+    args.loss_type = "l1"
+    args.use_interaction = True
+    args.use_prod = False  # turn on h ⊙ r
+    args.end_weight = 1.0  # asymmetric: weight end more
+    args.extra_order_pen = 0.0  # small extra order penalty
 
     # --- C: Huber, no |h-t| ---
     #args.loss_type = "huber"
@@ -110,9 +113,9 @@ if __name__ == '__main__':
     #args.use_interaction = False
 
     # --- D: Huber + |h-t| ---
-    args.loss_type = "huber"
-    args.huber_beta = 0.5
-    args.use_interaction = True
+    #args.loss_type = "huber"
+    #args.huber_beta = 0.5
+    #args.use_interaction = True
     # ================================================================
 
     exc = Execute_TP(args)

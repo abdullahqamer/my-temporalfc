@@ -359,7 +359,22 @@ class Execute_TP:
             mae_end = torch.abs(pred_end_years - y2_years).float().mean()
             print(f"[INFO] Eval {info!r} MAE (start year): {mae_start:.2f} years")
             print(f"[INFO] Eval {info!r} MAE (end year): {mae_end:.2f} years")
-            # 🔙 return a dict so callers can log it
+
+            # NEW: ±k accuracy
+            for k in (1, 3, 5, 10):
+                acc_k = (((pred_start_years - y1_years).abs() <= k) &
+                         ((pred_end_years - y2_years).abs() <= k)).float().mean()
+                print(f"[INFO] Eval {info!r} ±{k}y accuracy: {acc_k * 100:.2f}%")
+
+            # NEW: interval IoU (inclusive years; drop the +1 if you prefer continuous years)
+            inter_left = torch.max(pred_start_years, y1_years)
+            inter_right = torch.min(pred_end_years, y2_years)
+            inter = (inter_right - inter_left + 1).clamp(min=0)
+            union = (torch.max(pred_end_years, y2_years) - torch.min(pred_start_years, y1_years) + 1)
+            iou = (inter / union).mean()
+            print(f"[INFO] Eval {info!r} Interval IoU: {iou:.3f}")
+
+            #  return a dict so callers can log it
             return {
                 "exact_match": float((correct * 100.0).item()),
                 "mae_start_years": float(mae_start.item()),

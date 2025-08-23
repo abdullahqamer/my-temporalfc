@@ -301,6 +301,9 @@ def select_model(args) -> Tuple[pl.LightningModule, AnyStr]:
             use_interaction=args.use_interaction,
             loss_type=args.loss_type,
             huber_beta=args.huber_beta,
+            use_prod=getattr(args, "use_prod", False),
+            end_weight=getattr(args, "end_weight", 1.0),
+            extra_order_pen=getattr(args, "extra_order_pen", 0.0),
             hidden_dim=256,
             dropout=0.3,
             lr=1e-3
