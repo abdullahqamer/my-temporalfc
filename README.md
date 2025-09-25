@@ -1,52 +1,108 @@
-````markdown
-# TemporalFC — MLP Range Prediction (Thesis Branch)
+# TemporalFC — MLP for Temporal Range Prediction
 
-This branch contains a **simple, fast MLP** that predicts a **time range** (start year, end year) for a triple **(subject, predicate, object)** from a temporal knowledge graph.
+Predict the **start** and **end** year of a fact given a triple **(subject, predicate, object)**.
+This repo contains a lightweight MLP model that maps triple embeddings to a **time interval**.
 
-- **Earlier baseline (before this branch):** MAE ≈ **17.6 / 18.7**, IoU ≈ **0.53**  
-- **Current best (this branch):** MAE ≈ **3.6 / 5.2**, IoU ≈ **0.75** on `wikidata6`
-
-> This branch focuses only on the MLP range predictor (no ElasticSearch/path components).
+> **TL;DR**
+> Input: (s, p, o) → embeddings → MLP → outputs two numbers (start, end).
+> Best run so far (Wikidata6): **MAE ≈ 3.6 / 5.2 years**, **IoU ≈ 0.75**.
 
 ---
 
-## 1) Quick Start
+## Highlights
+
+* **Simple architecture**: 3×(Linear→GELU→Dropout) + 2-unit head (start & delta).
+* **Interval guarantee**: `end = start + (1 − start) * delta` ensures `end ≥ start`.
+* **Practical training tweaks** (data/opt regularization):
+
+  * Tiny **label jitter** on time indices (train-only)
+  * **Cosine LR** with a small floor
+  * Slightly higher **end loss weight**
+  * Tiny **Gaussian noise** on embeddings (train-only)
+
+---
+
+## Results (Wikidata6)
+
+| Setting                  | Start MAE ↓ | End MAE ↓ | IoU ↑ |
+| ------------------------ | ----------: | --------: | ----: |
+| Baseline MLP             |       ~17.6 |     ~18.7 | ~0.53 |
+| Improved MLP (this repo) |        ~3.6 |      ~5.2 | ~0.75 |
+
+*(MAE in years; higher IoU is better.)*
+
+---
+
+## Model at a glance
+
+```
+(s, p, o)
+   │
+   ├─→ Embeddings: h = emb(s), r = emb(p), t = emb(o)
+   │     (train-only) + tiny Gaussian noise on h,r,t
+   │
+   ├─→ Interaction features: |h−t|,  h⊙t
+   │
+   ├─→ Concat: x = [h, r, t, |h−t|, h⊙t]
+   │
+   ├─→ MLP trunk:
+   │     Linear → GELU → Dropout
+   │     Linear → GELU → Dropout
+   │     Linear → GELU → Dropout
+   │
+   ├─→ Head (2 units): [s_raw, d_raw]
+   │     start = σ(s_raw)
+   │     delta = σ(d_raw)
+   │     end   = start + (1 − start) * delta   (guarantees end ≥ start)
+   │
+   └─→ Output: [start_norm, end_norm]  (normalized to [0,1], later mapped to years)
+```
+
+---
+
+## Installation
+
+Tested with Python 3.9+ and PyTorch.
 
 ```bash
-# clone
+# 1) clone
 git clone https://github.com/abdullahqamer/my-temporalfc.git
 cd my-temporalfc
 
-# switch to this branch (if not already on it)
-git checkout MLP
+# 2) (recommended) create and activate a virtual env
+python -m venv .venv
+source .venv/bin/activate   # on Windows: .venv\Scripts\activate
 
-# create and activate environment (edit env name if you prefer)
-conda env create -f environment.yml
-conda activate tfc
-````
-
-### Get the dataset & embeddings
-
-Download the release and unzip it into the repo root so it creates `data_TP/...`:
-
-* [https://github.com/abdullahqamer/my-temporalfc/releases/tag/v1.0](https://github.com/abdullahqamer/my-temporalfc/releases/tag/v1.0)
-
-Expected layout (key parts):
-
-```
-data_TP/
-  wikidata6/
-    train/
-    valid/
-    test/
-    embeddings/      # e.g., dihedron *.npy
+# 3) install deps
+pip install -r requirements.txt
 ```
 
 ---
 
-## 2) Reproducing Thesis Results
+## Dataset
 
-### Train the MLP (range prediction)
+Download the prepared data release from GitHub:
+
+* **Wikidata6 release:**
+  [https://github.com/abdullahqamer/my-temporalfc/releases/tag/v1.0](https://github.com/abdullahqamer/my-temporalfc/releases/tag/v1.0)
+
+Unzip/place the contents so the repo can find:
+
+```
+dataset/
+  wikidata6/
+    train/...
+    valid/...
+    test/...
+```
+
+*(If your folder differs, adjust the `--path_dataset_folder` or related flags.)*
+
+---
+
+## Reproducing the improved result
+
+The command below matches the improved configuration that produced **MAE ≈ 3.6 / 5.2** and **IoU ≈ 0.75** on Wikidata6. (Minor variation is normal due to random seeds.)
 
 ```bash
 python main.py \
@@ -67,145 +123,64 @@ python main.py \
   --num_workers 4 \
   --max_num_epochs 120 \
   --seed 42 \
-  --emb_noise 0.02
+  --emb_noise 0.01
 ```
 
-**Notes**
+Notes:
 
-* `--emb_noise` adds tiny Gaussian noise to entity/relation embeddings **during training only** (helps generalization).
-* A **cosine LR schedule (with a low floor)** and **tiny label jitter** are already handled inside the model code—no extra flags needed.
-* To approximate an older/simpler baseline, you can try `--end_weight 0.86` and `--emb_noise 0.00`.
+* **Cosine LR** schedule is configured inside the model (`CosineAnnealingLR` with a small floor).
+* **Label jitter** is applied train-only (inside the training step), so you don’t need flags for it.
+* **End loss weight** (`--end_weight 0.95`) slightly emphasizes the end boundary, which helped IoU.
 
-### Evaluate the best checkpoint
+---
 
-Training stores checkpoints under `dataset/HYBRID_Storage/<timestamp>/...`. Evaluate with:
+## Quick evaluation
 
-```bash
-python evaluate_checkpoint_model_TP.py \
-  --checkpoint_dir_folder all \
-  --checkpoint_dataset_folder dataset/ \
-  --eval_dataset wikidata6 \
-  --model range-mlp \
-  --task range-prediction \
-  --emb_type dihedron \
-  --embedding_dim 100
+If you trained with checkpoints enabled, the script will automatically load the best checkpoint for testing/evaluation. Otherwise, specify `--resume_from_checkpoint` when needed.
+
+Typical output includes:
+
+* Start/End **MAE** (years)
+* **IoU** of predicted interval vs. ground truth
+* ±k-year accuracies
+
+---
+
+## Repo structure (short)
+
+```
+my-temporalfc/
+├─ main.py                     # entry point
+├─ executer_TP.py              # training/eval runner (Lightning)
+├─ nn_models_TP/range_mlp_model.py   # MLP model for start/end
+├─ utils_TP/                   # helpers
+└─ dataset/                    # place Wikidata6 here (see Dataset section)
 ```
 
 ---
 
-## 3) Model Overview (What the MLP does)
+## How this work builds on prior tools
 
-**Input:** a triple **(s, p, o)**
-**Embeddings:**
+This project stands on the shoulders of open-source frameworks and ideas:
 
-* `h = emb(s)` (subject), `r = emb(p)` (predicate), `t = emb(o)` (object)
+* **PyTorch** — tensor library and autograd
+* **PyTorch Lightning** — structured training loop
+* **Wikidata** — source of temporal facts (processed into the “Wikidata6” split)
+* **Embedding ideas (e.g., Dihedron)** — entity/relation embeddings for triples
 
-**Interaction features:**
-
-* absolute difference `|h − t|`
-* elementwise product `h ⊙ t`
-
-**Concatenate features:**
-
-* `x = [h, r, t, |h − t|, h ⊙ t]`
-
-**MLP trunk (fully-connected stack):**
-
-```
-Linear → GELU → Dropout
-Linear → GELU → Dropout
-Linear → GELU → Dropout
-```
-
-**Head (2 outputs):**
-
-* `Linear(out=2) → [s_raw, d_raw]`
-
-**Map to [0,1] and build a valid interval:**
-
-* `start = σ(s_raw)`
-* `delta = σ(d_raw)`
-* `end   = start + (1 − start) * delta`  (guarantees `end ≥ start` and both in `[0,1]`)
-
-**Training objective:**
-
-* Huber loss on `(start, end)` vs. target years (normalized).
-* Small “order/consistency” penalty to discourage `end < start`.
-
-**Key changes that improved results in this branch:**
-
-* **Label jitter (tiny, training-only):** small noise on target time indices → more robust.
-* **Cosine learning-rate schedule with a low floor:** fast early learning, gentle late refinement.
-* **Slightly higher end weight in the loss:** improves interval quality/IoU.
-* **Tiny embedding noise (training-only):** regularizes embeddings without affecting inference.
+Thanks to the maintainers and communities behind these tools and datasets.
 
 ---
 
-## 4) Directory Structure (relevant parts)
+## License
 
-```
-.
-├── main.py                          # training / validation entrypoint
-├── evaluate_checkpoint_model_TP.py  # evaluation for time-range prediction
-├── nn_models_TP/
-│   └── range_mlp_model.py           # MLP architecture & training logic
-├── utils_TP/                        # data utilities, model selection, etc.
-└── data_TP/                         # dataset & embeddings (after download)
-```
+This repository is released for academic/research use.
+Please check licenses of dependencies and datasets accordingly.
 
 ---
 
-## 5) Tips
+## Contact
 
-* Use `--num_workers` to speed up data loading (e.g., 4–8 if your CPU allows).
-* Keep `--seed 42` for exact reproducibility in the thesis runs.
-* If a GPU is available, PyTorch Lightning will use it automatically.
+Questions or issues? Please open a GitHub issue or reach out via the repository.
 
 ---
-
-## 6) Acknowledgements & Related Work
-
-This branch builds on and reuses parts of the original **TemporalFC** codebase and ideas:
-
-* **TemporalFC (ISWC 2023)** — temporal fact checking & time prediction framework.
-  Please cite the original paper from the upstream project.
-
-Embeddings & tooling:
-
-* **Dihedron** temporal KG embeddings (used for entity/relation vectors).
-* **PyTorch** and **PyTorch Lightning** for training infrastructure.
-
-> If you use this branch, please credit the original TemporalFC work and the Dihedron embeddings.
-
----
-
-## 7) Citation (TemporalFC)
-
-```bibtex
-@inproceedings{10.1007/978-3-031-47240-4_25,
-  title     = {TemporalFC: A Temporal Fact Checking Approach over Knowledge Graphs},
-  author    = {Qudus, Umair and Röder, Michael and Kirrane, Sabrina and Ngomo, Axel-Cyrille Ngonga},
-  booktitle = {The Semantic Web – ISWC 2023},
-  year      = {2023}
-}
-```
-
-```bibtex
-@inproceedings{NayyeriVKAWBL22,
-  author    = {Mojtaba Nayyeri and Sahar Vahdati and Md\,Tansen\,Khan and Mirza\,Mohtashim\,Alam and Lisa\,Wenige and Andreas\,Behrend and Jens\,Lehmann},
-  title     = {Dihedron Algebraic Embeddings for Spatio‑Temporal Knowledge Graph Completion},
-  booktitle = {The Semantic Web – 19th International Conference (ESWC 2022), Hersonissos, Crete, Greece, May 29 – June 2, 2022, Proceedings},
-  series    = {Lecture Notes in Computer Science},
-  volume    = {13261},
-  pages     = {253--269},
-  year      = {2022},
-  publisher = {Springer},
-  doi       = {10.1007/978-3-031-06981-9_15}
-}
-
-```
-
-```
-::contentReference[oaicite:0]{index=0}
-```
-
