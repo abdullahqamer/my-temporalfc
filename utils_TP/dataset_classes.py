@@ -41,17 +41,37 @@ class RangePredictionDataset(Dataset):
     """
     Each item is (h, r, t, year1_idx, year2_idx)
     """
-    def __init__(self,triples_idx, num_entities, num_relations, num_times, neg_sample_ratio = 0):
-        triples = torch.LongTensor(triples_idx)
+
+    def __init__(self, triples_idx, num_entities, num_relations, num_times, neg_sample_ratio=0):
+        # Handle empty split safely
+        if not triples_idx:
+            empty = torch.zeros(0, dtype=torch.long)
+            self.head_idx = empty
+            self.rel_idx = empty
+            self.tail_idx = empty
+            self.y1_idx = empty
+            self.y2_idx = empty
+            self.length = 0
+            self.num_entities = num_entities
+            self.num_relations = num_relations
+            self.num_times = num_times
+            return
+
+        triples = torch.as_tensor(triples_idx, dtype=torch.long)
+        if triples.ndim != 2 or triples.size(1) != 5:
+            raise ValueError(f"RangePredictionDataset expects Nx5, got shape {tuple(triples.shape)}")
+
         self.head_idx = triples[:, 0]
         self.rel_idx = triples[:, 1]
         self.tail_idx = triples[:, 2]
         self.y1_idx = triples[:, 3]
         self.y2_idx = triples[:, 4]
-        self.length = len(triples)
+        self.length = triples.size(0)
+
         self.num_entities = num_entities
         self.num_relations = num_relations
         self.num_times = num_times
+
     def __len__(self):
         return self.length
     def __getitem__(self, idx):
@@ -127,7 +147,11 @@ class StandardDataModule(pl.LightningDataModule):
             #self.batch_size = batch_size1
             #train_set = RangePredictionDataset(self.paired_train_idx)
             ds = RangePredictionDataset(self.train_set_idx, num_entities=self.num_entities, num_relations=self.num_relations, num_times=self.num_times)
-            return DataLoader(ds, batch_size=batch_size1, shuffle=True,num_workers=12)
+            if len(ds) == 0:
+                print("⚠️  Train split is empty after mapping — check ID normalization & maps.")
+                # return a minimal loader to avoid crashing early; training will effectively be skipped
+                return DataLoader(ds, batch_size=1, shuffle=False, num_workers=self.num_workers)
+            return DataLoader(ds, batch_size=batch_size1, shuffle=True,num_workers=self.num_workers)
 
     def val_dataloader(self, batch_size1) -> DataLoader:
 
@@ -151,7 +175,11 @@ class StandardDataModule(pl.LightningDataModule):
         elif self.form == 'RangePrediction':
             # uses the paired (h,p,o,t1,t2) list we built in Data.__init__
             ds = RangePredictionDataset(self.valid_set_idx or [], num_entities=self.num_entities, num_relations=self.num_relations, num_times=self.num_times)
-            return DataLoader(ds, batch_size=batch_size1, shuffle=False,num_workers=12)
+            if len(ds) == 0:
+                print("⚠️  Train split is empty after mapping — check ID normalization & maps.")
+                # return a minimal loader to avoid crashing early; training will effectively be skipped
+                return DataLoader(ds, batch_size=1, shuffle=False, num_workers=self.num_workers)
+            return DataLoader(ds, batch_size=batch_size1, shuffle=False,num_workers=self.num_workers)
 
     def dataloaders(self, batch_size1) -> DataLoader:
         if self.form == 'FactChecking':
@@ -170,7 +198,7 @@ class StandardDataModule(pl.LightningDataModule):
         elif self.form == 'RangePrediction':
             # uses the paired (h,p,o,t1,t2) list we built in Data.__init__
             ds = RangePredictionDataset(self.test_set_idx, num_entities=self.num_entities, num_relations=self.num_relations, num_times=self.num_times)
-            return DataLoader(ds, batch_size=batch_size1, shuffle=False,num_workers=12)
+            return DataLoader(ds, batch_size=batch_size1, shuffle=False,num_workers=self.num_workers)
 
     def setup(self, *args, **kwargs):
         pass

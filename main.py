@@ -4,8 +4,11 @@ from executer_TP import Execute_TP
 import pytorch_lightning as pl
 import argparse
 import os
-from pytorch_lightning import Trainer, seed_everything
-seed_everything(42, workers=True)
+import copy
+import optuna
+
+from pytorch_lightning import Trainer
+#seed_everything(42, workers=True)
 
 current_dir = os.getcwd()
 DATA_PATH = os.path.join(current_dir,"data_TP")
@@ -15,12 +18,37 @@ def argparse_default(description=None):
 
     #my editing
     # --- Model ablation flags (can be overridden by presets below) ---
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Global seed for reproducibility")
+    parser.add_argument("--do_ablation", type=lambda s: str(s).lower() in ["1", "true", "yes"], default=False,
+                        help="Run a small ablation grid instead of a single training run")
+
     parser.add_argument("--loss_type", type=str, default="l1", choices=["l1", "huber"],
                         help="Loss for normalized endpoints: l1 or huber")
     parser.add_argument("--huber_beta", type=float, default=0.5,
                         help="Huber beta (only used if loss_type=huber)")
     parser.add_argument("--use_interaction", type=lambda s: str(s).lower() in ["1", "true", "yes"], default=False,
                         help="If true, add |h - t| to inputs")
+    # --- Extra knobs ---
+    parser.add_argument("--lr", type=float, default=1e-3,
+                        help="Optimizer learning rate")
+    parser.add_argument("--end_weight", type=float, default=1.0,
+                        help="Extra weight on end-year loss term")
+    parser.add_argument("--extra_order_pen", type=float, default=0.0,
+                        help="Penalty for predicted end < start (applied in normalized space)")
+    parser.add_argument("--use_prod", type=lambda s: str(s).lower() in ["1", "true", "yes"], default=False,
+                        help="If true, add elementwise h*t interaction to features")
+    # embedding noise (tiny Gaussian noise on E/R/T embeddings during training)
+    parser.add_argument("--emb_noise", type=float, default=0.0,
+                        help="Stddev of Gaussian noise added to entity/relation embeddings during training (0.0 disables).")
+
+    # --- Optuna (Bayesian) search flags ---
+    parser.add_argument("--optuna_trials", type=int, default=0,
+                        help="Number of Optuna trials; 0 disables tuning")
+    parser.add_argument("--optuna_timeout", type=int, default=0,
+                        help="Global timeout in seconds for Optuna (0 = no timeout)")
+
+
 
     #parser.add_argument("--path_train_dataset", type=str, required=True, help="data_TP/dbpedia124k/")
     # Paths.
@@ -89,9 +117,116 @@ def argparse_default(description=None):
     else:
         return parser.parse_args(description)
 
-if __name__ == '__main__':
+import copy
+
+def run_optuna(args):
+    try:
+        import optuna
+    except ModuleNotFoundError:
+        raise RuntimeError("Install Optuna: pip install 'optuna>=3,<4'")
+
+    def objective(trial):
+        targs = copy.deepcopy(args)
+
+        # --- sampled hyperparams ---
+        targs.lr = trial.suggest_float("lr", 7e-4, 2e-3, log=True)
+        targs.loss_type = "huber"
+        targs.huber_beta = trial.suggest_float("huber_beta", 0.35, 0.9)
+        targs.end_weight = trial.suggest_float("end_weight", 0.8, 1.4)
+        targs.extra_order_pen = trial.suggest_float("extra_order_pen", 0.02, 0.12)
+        targs.use_interaction = False
+        targs.use_prod        = True
+
+        # --- keep trials short (set BEFORE creating Execute_TP) ---
+        targs.max_num_epochs = min(getattr(args, "max_num_epochs", 100), 60)
+        targs.min_num_epochs = getattr(args, "min_num_epochs", 1)
+        # optional: make sure we validate every epoch during tuning
+        targs.check_val_every_n_epochs = 1
+
+        # train once and return best val
+        ex = Execute_TP(targs)
+        _, best_val = ex.fit_return_best()
+        return best_val
+
+    # optional: make results reproducible
+    sampler = optuna.samplers.TPESampler(seed=42)
+    study = optuna.create_study(direction="minimize", sampler=sampler)
+    study.optimize(
+        objective,
+        n_trials=args.optuna_trials,
+        timeout=args.optuna_timeout if args.optuna_timeout > 0 else None,
+        show_progress_bar=True,
+    )
+    print("Optuna best params:", study.best_trial.params)
+    print("Optuna best val_loss:", study.best_value)
+    return study
+
+def run_ablation_grid(base_args):
+    """
+    Run a tiny matrix of configs to validate that certain switches help.
+    Results will go to separate run folders and into results.csv (your code already writes it).
+    """
+    from copy import deepcopy
+    from executer_TP import Execute_TP
+
+    # Keep runs short but comparable
+    base_epochs = getattr(base_args, "max_num_epochs", 100)
+    short_epochs = min(base_epochs, 30)
+
+    grid = [
+        # (A) Your tuned "best" config (reference)
+        dict(name="best", use_prod=True,  extra_order_pen=base_args.extra_order_pen,
+             end_weight=base_args.end_weight, loss_type=base_args.loss_type,
+             huber_beta=base_args.huber_beta, lr=base_args.lr),
+
+        # (B) Turn off use_prod only
+        dict(name="no_prod", use_prod=False),
+
+        # (C) Remove order penalty only
+        dict(name="no_order_pen", extra_order_pen=0.0),
+
+        # (D) L1 vs Huber check (only if your best uses huber)
+        dict(name="l1_check", loss_type="l1"),
+    ]
+
+    for spec in grid:
+        a = deepcopy(base_args)
+        # apply overrides
+        for k,v in spec.items():
+            if k == "name":
+                continue
+            setattr(a, k, v)
+
+        # keep runs short & deterministic
+        a.max_num_epochs = short_epochs
+        a.min_num_epochs = getattr(a, "min_num_epochs", 1)
+        a.check_val_every_n_epochs = 1
+        # give each run its own folder suffix
+        a.storage_path = f"{base_args.storage_path}/{spec['name']}"
+
+        print(f"\n[ABLATION] Running {spec['name']} with overrides: "
+              f"{ {k:v for k,v in spec.items() if k!='name'} }")
+        ex = Execute_TP(a)
+        ex.start()
+
+
+if __name__ == "__main__":
     args = argparse_default()
-    print("Parsed Arguments:", args)  # my editing for checking where my code gets killed?
+
+    if args.optuna_trials and args.optuna_trials > 0:
+        run_optuna(args)
+    elif getattr(args, "do_ablation", False):
+        run_ablation_grid(args)
+    else:
+        ex = Execute_TP(args)
+        ex.start()
+
+
+
+
+#if __name__ == '__main__':
+ #   args = argparse_default()
+  #  print("Parsed Arguments:", args)  # my editing for checking where my code gets killed?
 
     # ===== A/B/C/D PRESETS: uncomment ONE block you want to run =====
 
@@ -101,11 +236,11 @@ if __name__ == '__main__':
     # args.huber_beta = 0.5  # (ignored for L1)
 
     # --- B: L1 + |h-t| ---
-    args.loss_type = "l1"
-    args.use_interaction = True
-    args.use_prod = False  # turn on h ⊙ r
-    args.end_weight = 1.0  # asymmetric: weight end more
-    args.extra_order_pen = 0.0  # small extra order penalty
+   # args.loss_type = "l1"
+    #args.use_interaction = True
+   # args.use_prod = False  # turn on h ⊙ r
+    #args.end_weight = 1.0  # asymmetric: weight end more
+    #args.extra_order_pen = 0.0  # small extra order penalty
 
     # --- C: Huber, no |h-t| ---
     #args.loss_type = "huber"
@@ -118,8 +253,8 @@ if __name__ == '__main__':
     #args.use_interaction = True
     # ================================================================
 
-    exc = Execute_TP(args)
-    exc.start()
+  #  exc = Execute_TP(args)
+   # exc.start()
 
 
 

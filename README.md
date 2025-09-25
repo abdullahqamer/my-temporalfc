@@ -1,176 +1,211 @@
-# TemporalFC: A Temporal Fact-Checking Approach for Knowledge Graphs
-<p><img src = "https://files.dice-research.org/datasets/ISWC2023_TemporalFC//logo.jpeg" alt = "TemporalFC Logo" width = "30%" align = "center"></p>
+````markdown
+# TemporalFC — MLP Range Prediction (Thesis Branch)
 
-This open-source project contains the Python implementation of our approach [TemporalFC](https://papers.dice-research.org/2023/ISWC_TemporalFC/public.pdf) (published at ISWC2023). This project is designed to ease real-world applications of fact-checking over knowledge graphs and produce better results. With this aim, we rely on:
+This branch contains a **simple, fast MLP** that predicts a **time range** (start year, end year) for a triple **(subject, predicate, object)** from a temporal knowledge graph.
 
-1. [PytorchLightning](https://www.pytorchlightning.ai/) to perform training via multi-CPUs, GPUs, TPUs or  computing cluster, 
-2. [Pre-trained-TKG-embeddings](https://link.springer.com/chapter/10.1007/978-3-031-06981-9_15) to get pre-trained TKG embeddings for knowledge graphs for knowledge graph-based component, 
-3. [Elastic-search](https://www.elastic.co/blog/loading-wikipedia) to load text corpus (wikipedia) on elastic search for text-based component, and
-4. [Path-based-approach](https://github.com/dice-group/COPAAL/tree/develop) to calculate output score for the path-based component.
+- **Earlier baseline (before this branch):** MAE ≈ **17.6 / 18.7**, IoU ≈ **0.53**  
+- **Current best (this branch):** MAE ≈ **3.6 / 5.2**, IoU ≈ **0.75** on `wikidata6`
 
-This project performs 2 independent tasks:
-1. Fact-checking
-2. Time-point prediction
+> This branch focuses only on the MLP range predictor (no ElasticSearch/path components).
 
+---
 
-## Installation
-First clone the repository:
-``` html
-git clone https://github.com/dice-group/TemporalFC.git
+## 1) Quick Start
 
-cd TemporalFC
-``` 
+```bash
+# clone
+git clone https://github.com/abdullahqamer/my-temporalfc.git
+cd my-temporalfc
 
-## Reproducing Results
-There are two options to reproduce results. 
-1) Using pre-processed input dataset, and 
-2) Regenerate input dataset from scratch.
+# switch to this branch (if not already on it)
+git checkout MLP
 
-Select any 1 of these 2 options.
-
-### 1) Re-Using pre-generated dataset
-download and unzip data and embeddings files in the root folder of the project.
-
-``` html
-pip install gdown
-
-wget https://files.dice-research.org/datasets/ISWC2023_TemporalFC/data_TP.zip
-
-unzip data_TP.zip
-``` 
-
-Note: if it gives permission denied error you can try running the commands with "sudo"
-
-
-
-### 2) Generating dataset from scratch
-To regenerate data from scratch, you need to re-train the embedding algorithm again and put the generated embeddings in data_TP/dataset_name/embeddings folder, and dataset in data_TP/dataset_name/train and data_TP/dataset_name/test foder.
-
-Detailed instructions are in [overall_process](https://github.com/dice-group/TemporalFC/tree/main/overall_process) folder.
-
-## Running experiments
-Install dependencies via conda:
-``` html
-
-#setting up environment
-#creating and activating conda environment
-
+# create and activate environment (edit env name if you prefer)
 conda env create -f environment.yml
-
 conda activate tfc
+````
 
-#If conda command not found: download miniconda from (https://docs.conda.io/en/latest/miniconda.html#linux-installers) and set the path: 
-#export PATH=/path-to-conda/miniconda3/bin:$PATH
+### Get the dataset & embeddings
+
+Download the release and unzip it into the repo root so it creates `data_TP/...`:
+
+* [https://github.com/abdullahqamer/my-temporalfc/releases/tag/v1.0](https://github.com/abdullahqamer/my-temporalfc/releases/tag/v1.0)
+
+Expected layout (key parts):
 
 ```
-start generating results:
-
-#### Fact Checking component
-``` html
-
-# Start training process, with required number of hyperparemeters. Details about other hyperparameters is in main.py file.
-python main.py --eval_dataset Dbpedia124k --model temporal-full-hybrid  --max_num_epochs 500   --min_num_epochs 50 --batch_size 12000 --val_batch_size 1000  --negative_triple_generation corrupted-triple-based  --task fact-checking --emb_type dihedron --embedding_dim 100 --num_workers 1
-# computing evaluation files from saved model in "dataset/Hybrid_Stroage" directory
-python evaluate_checkpoint_model_FC.py --checkpoint_dir_folder all --checkpoint_dataset_folder dataset/  --eval_dataset Dbpedia124k --model temporal-full-hybrid  --max_num_epochs 500   --min_num_epochs 50 --batch_size 12000 --val_batch_size 1000  --negative_triple_generation corrupted-triple-based  --task fact-checking --emb_type dihedron --embedding_dim 100 --num_workers 1
-
-``` 
-
-#### Time-point prediction component
-
-``` html
-
-# Start training process, with required number of hyperparemeters. Details about other hyperparameters is in main.py file.
-python main.py --eval_dataset Dbpedia124k --model temporal-prediction-model  --max_num_epochs 500   --min_num_epochs 50 --batch_size 12000 --val_batch_size 1000  --negative_triple_generation False  --task time-prediction --emb_type dihedron --embedding_dim 100 --num_workers 1
-# computing evaluation files from saved model in "dataset/Hybrid_Stroage" directory
-python evaluate_checkpoint_model_TP.py --checkpoint_dir_folder all --checkpoint_dataset_folder dataset/  --eval_dataset Dbpedia124k --model temporal-prediction-model  --max_num_epochs 500   --min_num_epochs 50 --batch_size 12000 --val_batch_size 1000  --negative_triple_generation False  --task time-prediction --emb_type dihedron --embedding_dim 100 --num_workers 1
-
-``` 
-
-##### comments:
-1. To reproduce exact results you have to use exact parameters as listed above.
-
-2. For other datasets you need to change the parameter in front of --eval_dataset
-
-3. Use parallel processing for fast processing. Default parameter is set to 4 workers that we used to generate results.
-
-Available embeddings types:
-[dihedron](https://link.springer.com/chapter/10.1007/978-3-031-06981-9_15)
-
-Available models:
-temporal-prediction-model, temporal-full-hybrid
-
-Note: model names are case-sensitive. So please use exact names.
-
-#### Fact checking part:
-Fact checking part should contain negative triple generation parameter. 
-
-Available options are: (1) corrupted-triple-based and (2) corrupted-time-based,
-
-## Future plan:
-As future work, we will exploit the modularity of TemporalFC by integrating time-period based fact checking. 
-
-## Acknowledgement 
-The work has been supported by the EU H2020 Marie Skłodowska-Curie project KnowGraphs (no. 860801)).
-
-## References
-If you find our work useful in your research, please consider citing the respective paper:
+data_TP/
+  wikidata6/
+    train/
+    valid/
+    test/
+    embeddings/      # e.g., dihedron *.npy
 ```
-#TemporalFC
+
+---
+
+## 2) Reproducing Thesis Results
+
+### Train the MLP (range prediction)
+
+```bash
+python main.py \
+  --eval_dataset wikidata6 \
+  --task range-prediction \
+  --model range-mlp \
+  --emb_type dihedron \
+  --embedding_dim 100 \
+  --batch_size 1024 \
+  --val_batch_size 1000 \
+  --use_interaction 1 \
+  --use_prod 1 \
+  --loss_type huber \
+  --huber_beta 0.8970321391066037 \
+  --end_weight 0.95 \
+  --extra_order_pen 0.042741660857969106 \
+  --lr 0.00184775182894049 \
+  --num_workers 4 \
+  --max_num_epochs 120 \
+  --seed 42 \
+  --emb_noise 0.02
+```
+
+**Notes**
+
+* `--emb_noise` adds tiny Gaussian noise to entity/relation embeddings **during training only** (helps generalization).
+* A **cosine LR schedule (with a low floor)** and **tiny label jitter** are already handled inside the model code—no extra flags needed.
+* To approximate an older/simpler baseline, you can try `--end_weight 0.86` and `--emb_noise 0.00`.
+
+### Evaluate the best checkpoint
+
+Training stores checkpoints under `dataset/HYBRID_Storage/<timestamp>/...`. Evaluate with:
+
+```bash
+python evaluate_checkpoint_model_TP.py \
+  --checkpoint_dir_folder all \
+  --checkpoint_dataset_folder dataset/ \
+  --eval_dataset wikidata6 \
+  --model range-mlp \
+  --task range-prediction \
+  --emb_type dihedron \
+  --embedding_dim 100
+```
+
+---
+
+## 3) Model Overview (What the MLP does)
+
+**Input:** a triple **(s, p, o)**
+**Embeddings:**
+
+* `h = emb(s)` (subject), `r = emb(p)` (predicate), `t = emb(o)` (object)
+
+**Interaction features:**
+
+* absolute difference `|h − t|`
+* elementwise product `h ⊙ t`
+
+**Concatenate features:**
+
+* `x = [h, r, t, |h − t|, h ⊙ t]`
+
+**MLP trunk (fully-connected stack):**
+
+```
+Linear → GELU → Dropout
+Linear → GELU → Dropout
+Linear → GELU → Dropout
+```
+
+**Head (2 outputs):**
+
+* `Linear(out=2) → [s_raw, d_raw]`
+
+**Map to [0,1] and build a valid interval:**
+
+* `start = σ(s_raw)`
+* `delta = σ(d_raw)`
+* `end   = start + (1 − start) * delta`  (guarantees `end ≥ start` and both in `[0,1]`)
+
+**Training objective:**
+
+* Huber loss on `(start, end)` vs. target years (normalized).
+* Small “order/consistency” penalty to discourage `end < start`.
+
+**Key changes that improved results in this branch:**
+
+* **Label jitter (tiny, training-only):** small noise on target time indices → more robust.
+* **Cosine learning-rate schedule with a low floor:** fast early learning, gentle late refinement.
+* **Slightly higher end weight in the loss:** improves interval quality/IoU.
+* **Tiny embedding noise (training-only):** regularizes embeddings without affecting inference.
+
+---
+
+## 4) Directory Structure (relevant parts)
+
+```
+.
+├── main.py                          # training / validation entrypoint
+├── evaluate_checkpoint_model_TP.py  # evaluation for time-range prediction
+├── nn_models_TP/
+│   └── range_mlp_model.py           # MLP architecture & training logic
+├── utils_TP/                        # data utilities, model selection, etc.
+└── data_TP/                         # dataset & embeddings (after download)
+```
+
+---
+
+## 5) Tips
+
+* Use `--num_workers` to speed up data loading (e.g., 4–8 if your CPU allows).
+* Keep `--seed 42` for exact reproducibility in the thesis runs.
+* If a GPU is available, PyTorch Lightning will use it automatically.
+
+---
+
+## 6) Acknowledgements & Related Work
+
+This branch builds on and reuses parts of the original **TemporalFC** codebase and ideas:
+
+* **TemporalFC (ISWC 2023)** — temporal fact checking & time prediction framework.
+  Please cite the original paper from the upstream project.
+
+Embeddings & tooling:
+
+* **Dihedron** temporal KG embeddings (used for entity/relation vectors).
+* **PyTorch** and **PyTorch Lightning** for training infrastructure.
+
+> If you use this branch, please credit the original TemporalFC work and the Dihedron embeddings.
+
+---
+
+## 7) Citation (TemporalFC)
+
+```bibtex
 @inproceedings{10.1007/978-3-031-47240-4_25,
-author = {Qudus, Umair and R\"{o}der, Michael and Kirrane, Sabrina and Ngomo, Axel-Cyrille Ngonga},
-title = {TemporalFC: A Temporal Fact Checking Approach over&nbsp;Knowledge Graphs},
-year = {2023},
-isbn = {978-3-031-47239-8},
-publisher = {Springer-Verlag},
-address = {Berlin, Heidelberg},
-url = {https://doi.org/10.1007/978-3-031-47240-4_25},
-doi = {10.1007/978-3-031-47240-4_25},
-booktitle = {The Semantic Web – ISWC 2023: 22nd International Semantic Web Conference, Athens, Greece, November 6–10, 2023, Proceedings, Part I},
-pages = {465–483},
-numpages = {19},
-keywords = {temporal fact checking, ensemble learning, transfer learning, time-point prediction, temporal knowledge graphs},
-location = {Athens, Greece}
+  title     = {TemporalFC: A Temporal Fact Checking Approach over Knowledge Graphs},
+  author    = {Qudus, Umair and Röder, Michael and Kirrane, Sabrina and Ngomo, Axel-Cyrille Ngonga},
+  booktitle = {The Semantic Web – ISWC 2023},
+  year      = {2023}
 }
+```
 
-
-#HybridFC
-@InProceedings{10.1007/978-3-031-19433-7_27,
-author="Qudus, Umair
-and R{\"o}der, Michael
-and Saleem, Muhammad
-and Ngonga Ngomo, Axel-Cyrille",
-editor="Sattler, Ulrike
-and Hogan, Aidan
-and Keet, Maria
-and Presutti, Valentina
-and Almeida, Jo{\~a}o Paulo A.
-and Takeda, Hideaki
-and Monnin, Pierre
-and Pirr{\`o}, Giuseppe
-and d'Amato, Claudia",
-title="HybridFC: A Hybrid Fact-Checking Approach for Knowledge Graphs",
-booktitle="The Semantic Web -- ISWC 2022",
-year="2022",
-publisher="Springer International Publishing",
-address="Cham",
-pages="462--480",
-isbn="978-3-031-19433-7"
+```bibtex
+@inproceedings{NayyeriVKAWBL22,
+  author    = {Mojtaba Nayyeri and Sahar Vahdati and Md\,Tansen\,Khan and Mirza\,Mohtashim\,Alam and Lisa\,Wenige and Andreas\,Behrend and Jens\,Lehmann},
+  title     = {Dihedron Algebraic Embeddings for Spatio‑Temporal Knowledge Graph Completion},
+  booktitle = {The Semantic Web – 19th International Conference (ESWC 2022), Hersonissos, Crete, Greece, May 29 – June 2, 2022, Proceedings},
+  series    = {Lecture Notes in Computer Science},
+  volume    = {13261},
+  pages     = {253--269},
+  year      = {2022},
+  publisher = {Springer},
+  doi       = {10.1007/978-3-031-06981-9_15}
 }
-
 
 ```
 
-In case you have any question, please contact: ```umair.qudus@uni-paderborn.de``` or ```umair.qudus@hotmail.com```
-
-## Authors
-* [Umair Qudus](https://dice-research.org/UmairQudus) (DICE, Paderborn University) 
-* [ Michael Röder](https://dice-research.org/MichaelRoeder) (DICE,  Paderborn University) 
-* [Sabrina Kirrane](http://sabrinakirrane.com/) (WU,  WU Vienna) 
-* [Axel-Cyrille Ngonga Ngomo](https://dice-research.org/AxelCyrilleNgongaNgomo) (DICE,  Paderborn University)
-  
-
-
-
-
-
+```
+::contentReference[oaicite:0]{index=0}
+```
 

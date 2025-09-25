@@ -17,10 +17,10 @@ from sklearn.model_selection import KFold
 
 import json
 import pytorch_lightning as pl
-from pytorch_lightning.plugins import DDPPlugin,DataParallelPlugin
+#from pytorch_lightning.plugins import DDPPlugin,DataParallelPlugin
 # from utils.dataset_classes import StandardDataModule
-from pytorch_lightning import Trainer, seed_everything
-seed_everything(42, workers=True)
+from pytorch_lightning import Trainer
+#seed_everything(42, workers=True)
 
 
 class Execute_TP:
@@ -28,6 +28,8 @@ class Execute_TP:
         args = preprocesses_input_args(args)
         sanity_checking_with_arguments(args)
         self.args = args
+        from pytorch_lightning import seed_everything
+        seed_everything(getattr(args, "seed", 42), workers=True)
         # 1. Create an instance of KG.
         self.args.dataset = Data(args=args)
         print(f"[DEBUG] idx_time_dict keys: {list(self.args.dataset.idx_time_dict.keys())[:10]}")  # Print first 10 keys
@@ -118,15 +120,42 @@ class Execute_TP:
             save_top_k=1,
             mode="min",
         )
-        early_stopping_callback = EarlyStopping(monitor="val_loss", patience=10)
         # 1. Create Pytorch-lightning Trainer object from input configuration
         # print(torch.cuda.device_count())
-        if torch.cuda.is_available():
-            self.trainer = pl.Trainer.from_argparse_args(self.args, plugins=DataParallelPlugin(),
-                                                     callbacks = [early_stopping_callback, checkpoint], gpus=1)
-        else:
-            self.trainer = pl.Trainer.from_argparse_args(self.args,
-                                                     callbacks = [early_stopping_callback, checkpoint])
+        # new: explicit single-process trainer (no dp/ddp_spawn)
+        # --- single-process trainer, compatible with old & new PL ---
+        # compute robust epoch args
+        max_epochs = getattr(self.args, "max_num_epochs", getattr(self.args, "max_epochs", 80))
+        pat = max(15, int(0.4 * max_epochs))  # e.g., 40% of max epochs
+        early_stopping_callback = EarlyStopping(monitor="val_loss", patience=pat, mode="min")
+        min_epochs = getattr(self.args, "min_num_epochs", getattr(self.args, "min_epochs", 1))
+
+        try:
+            # newer PL
+            self.trainer = pl.Trainer(
+                accelerator="gpu" if torch.cuda.is_available() else "cpu",
+                devices=1,
+                max_epochs=max_epochs,
+                min_epochs=min_epochs,
+                callbacks=[early_stopping_callback, checkpoint],
+                enable_checkpointing=True,
+                gradient_clip_val=1.0,
+                gradient_clip_algorithm="norm",
+                logger=self.args.logger,
+            )
+        except TypeError:
+            # PL ≤ 1.5 fallback
+            self.trainer = pl.Trainer(
+                gpus=1 if torch.cuda.is_available() else None,
+                max_epochs=max_epochs,
+                min_epochs=min_epochs,
+                callbacks=[early_stopping_callback, checkpoint],
+                checkpoint_callback=True,
+                gradient_clip_val=1.0,
+                gradient_clip_algorithm="norm",
+                logger=self.args.logger,
+            )
+
         # 2. Check whether validation and test datasets are available.
         #if self.args.dataset.is_valid_test_available():
         trained_model = self.training()
@@ -136,6 +165,94 @@ class Execute_TP:
         # print(self.args.checkpoint_callback.best_model_path)
 
         return trained_model
+
+    def fit_return_best(self):
+        """
+        Lightweight training for hyperparameter search.
+        Trains and returns (model, best_val_loss) without running test/eval/store.
+        """
+        # 1) Build model and data loaders (same way as in training())
+        model, form_of_labelling = select_model(self.args)
+
+        if not self.args.batch_size:
+            self.args.batch_size = int(len(self.args.dataset.idx_train_set) / 3) + 1
+        if not self.args.val_batch_size:
+            self.args.val_batch_size = int(len(self.args.dataset.idx_valid_set) / 2) + 1
+
+        dataset = StandardDataModule(
+            train_set_idx=self.args.dataset.idx_train_set,
+            valid_set_idx=self.args.dataset.idx_valid_set,
+            test_set_idx=self.args.dataset.idx_test_set,
+            entities_count=self.args.dataset.num_entities,
+            relations_count=self.args.dataset.num_relations,
+            times_count=self.args.dataset.num_times,
+            form=form_of_labelling,
+            batch_size=self.args.batch_size,
+            num_workers=self.args.num_workers,
+        )
+        train_loader = dataset.train_dataloader(batch_size1=self.args.batch_size)
+        val_loader = dataset.val_dataloader(batch_size1=self.args.val_batch_size)
+
+        # 2) Minimal callbacks for Optuna
+        ckpt_cb = ModelCheckpoint(
+            monitor="val_loss", mode="min", save_top_k=1,
+            filename="optuna-{epoch:02d}-{val_loss:.4f}"
+        )
+        early_cb = EarlyStopping(monitor="val_loss", mode="min", patience=3)
+        # --- resolve epoch/val-check args robustly (works with either your flags or PL defaults)
+        max_epochs = getattr(self.args, "max_num_epochs", None)
+        if max_epochs is None:
+            max_epochs = getattr(self.args, "max_epochs", 100)
+
+        min_epochs = getattr(self.args, "min_num_epochs", None)
+        if min_epochs is None:
+            min_epochs = getattr(self.args, "min_epochs", 1)
+
+        check_val_every_n_epoch = getattr(
+            self.args, "check_val_every_n_epoch",
+            getattr(self.args, "check_val_every_n_epochs", 1)
+        )
+
+        # already computed max_epochs/min_epochs above in that method
+        try:
+            tuner_trainer = Trainer(
+                accelerator="gpu" if torch.cuda.is_available() else "cpu",
+                devices=1,
+                max_epochs=max_epochs,
+                min_epochs=min_epochs,
+                check_val_every_n_epoch=check_val_every_n_epoch,
+                enable_checkpointing=True,
+                logger=False,
+                enable_model_summary=False,
+                callbacks=[ckpt_cb, early_cb],
+                num_sanity_val_steps=0,
+                deterministic=True,
+            )
+        except TypeError:
+            tuner_trainer = Trainer(
+                gpus=1 if torch.cuda.is_available() else None,
+                max_epochs=max_epochs,
+                min_epochs=min_epochs,
+                check_val_every_n_epoch=check_val_every_n_epoch,
+                callbacks=[ckpt_cb, early_cb],
+                checkpoint_callback=True,
+                logger=False,
+                num_sanity_val_steps=0,
+                deterministic=True,
+            )
+
+        # 4) Fit once and pick the best val
+        tuner_trainer.fit(model, train_loader, val_loader)
+
+        # 5) Return best val (float). If none, use last val as fallback.
+        if ckpt_cb.best_model_score is not None:
+            best_val = float(ckpt_cb.best_model_score.detach().cpu().item())
+        else:
+            # fallback: last seen val_loss
+            m = tuner_trainer.callback_metrics.get("val_loss", None)
+            best_val = float(m.detach().cpu().item()) if m is not None else float("inf")
+
+        return model, best_val
 
     def training(self):
         """
@@ -177,8 +294,8 @@ class Execute_TP:
         self.logger.info(model)
 
         train_data = dataset.train_dataloader(batch_size1=self.args.batch_size)
-        batch = next(iter(train_data))
-        print(f"[DEBUG] range batch sampe:", batch)
+        #batch = next(iter(train_data))
+        #print(f"[DEBUG] range batch sampe:", batch)
         val_data = dataset.val_dataloader(batch_size1=self.args.val_batch_size)
 
      #   print(f"Training Data Size: {len(train_data.dataset)}")         # my editing for checking where my code gets killed?
@@ -209,8 +326,10 @@ class Execute_TP:
 
             results_path = Path(self.storage_path) / "results.csv"
             header = [
-                "timestamp", "run_folder", "preset", "loss_type", "huber_beta", "use_interaction",
-                "order_penalty_lambda", "embedding_dim", "batch_size", "lr",
+                "timestamp", "run_folder", "preset", "seed",
+                "loss_type", "huber_beta", "use_interaction", "use_prod",
+                "extra_order_pen", "end_weight",
+                "embedding_dim", "batch_size", "lr",
                 "val_loss_best", "test_loss",
                 "train_exact_match", "train_mae_start", "train_mae_end",
                 "test_exact_match", "test_mae_start", "test_mae_end"
@@ -222,10 +341,13 @@ class Execute_TP:
             loss_type = getattr(self.args, "loss_type", "l1")
             huber_beta = getattr(self.args, "huber_beta", 0.5)
             use_interaction = getattr(self.args, "use_interaction", False)
-            order_penalty_lambda = getattr(self.args, "order_penalty_lambda", 0.0)
+            use_prod = getattr(self.args, "use_prod", False)
+            extra_order_pen = getattr(self.args, "extra_order_pen", 0.0)
+            end_weight = getattr(self.args, "end_weight", 1.0)
+            seed = getattr(self.args, "seed", 42)
             embedding_dim = self.args.embedding_dim
             batch_size = self.args.batch_size
-            lr = 1e-3  # or read from model if you prefer
+            lr = getattr(model, "lr", getattr(self.args, "lr", 1e-3))
 
             # read from checkpoint filename or callback metrics if available
             #val_loss_best = float(self.trainer.callback_metrics.get("val_loss", torch.tensor(float('nan'))))
@@ -251,13 +373,15 @@ class Execute_TP:
 # already stored in `test_loss` variable
 
 # pull actual learning rate from model (default fallback if missing)
-            lr = getattr(model, "lr", 1e-4)
+            #lr = getattr(model, "lr", 1e-4)
 # optional: preset label for convenience
-            preset = f"{loss_type}_{'int' if use_interaction else 'base'}"
+            preset = f"{loss_type}_{'prod' if use_prod else 'base'}"
 
             row = [
-                ts, run_folder, preset, loss_type, huber_beta, use_interaction,
-                order_penalty_lambda, embedding_dim, batch_size, lr,
+                ts, run_folder, preset, seed,
+                loss_type, huber_beta, use_interaction, use_prod,
+                extra_order_pen, end_weight,
+                embedding_dim, batch_size, lr,
                 val_loss_best, test_loss,
                 train_metrics["exact_match"], train_metrics["mae_start_years"], train_metrics["mae_end_years"],
                 test_metrics["exact_match"], test_metrics["mae_start_years"], test_metrics["mae_end_years"],
@@ -337,49 +461,96 @@ class Execute_TP:
         X = np.array(triple_idx)
         X_tensor = torch.LongTensor(X)
         if self.args.task == 'range-prediction':
-            #5 column input: (h, r, t, y1, y2)
-            print(f"[DEBUG] eval input shape (Nx5): {X_tensor.shape}")
-            idx_s, idx_p, idx_o, y1_idx, y2_idx = (X_tensor[:, i] for i in range(5))
-            prob = model.forward_triples(idx_s, idx_p, idx_o, y1_idx, y2_idx, type="test" if "Test" in info else None)
-            start_pred, end_pred = prob
-            pred_start = start_pred.round().long().clamp(min=0, max=self.args.num_times-1)
-            pred_end = end_pred.round().long().clamp(min=0, max=self.args.num_times - 1)
-            correct = ((pred_start == y1_idx) & (pred_end == y2_idx)).float().mean()
-            print(f"[INFO] Eval {info!r} exact-match accuracy: {correct*100:.2f}%")
+            # 5-column input: (h, r, t, y1_idx, y2_idx)
+            N = X_tensor.shape[0]
+            dev = next(model.parameters()).device
+            # choose a safe eval batch size (use val_batch_size if set; cap to avoid OOM)
+            eval_bs = getattr(self.args, "val_batch_size", 512) or 512
+            eval_bs = int(min(max(64, eval_bs), 2048))
 
-            # Add MAE in years
-            y1_years = torch.tensor([float(model.year_idx_dict[int(i.item())]) for i in y1_idx], device=dev)
-            y2_years = torch.tensor([float(model.year_idx_dict[int(i.item())]) for i in y2_idx], device=dev)
+            # running sums (to avoid holding huge tensors)
+            exact_match_sum = 0.0
+            mae_start_sum = 0.0
+            mae_end_sum = 0.0
+            acc_pm = {1: 0.0, 3: 0.0, 5: 0.0, 10: 0.0}
+            iou_sum = 0.0
 
-            pred_start_years = torch.tensor([float(model.year_idx_dict[int(p.item())]) for p in pred_start],
-                                            device=dev)
-            pred_end_years = torch.tensor([float(model.year_idx_dict[int(p.item())]) for p in pred_end],
-                                          device=dev)
-            mae_start = torch.abs(pred_start_years - y1_years).float().mean()
-            mae_end = torch.abs(pred_end_years - y2_years).float().mean()
+            model.eval()
+            with torch.no_grad():
+                for s in range(0, N, eval_bs):
+                    e = min(N, s + eval_bs)
+                    B = e - s
+                    batch = X_tensor[s:e].to(dev)
+                    idx_s, idx_p, idx_o, y1_idx, y2_idx = (batch[:, i] for i in range(5))
+
+                    # forward to index space (float), then clamp and round
+                    start_idx_f, end_idx_f = model.forward_triples(idx_s, idx_p, idx_o, y1_idx, y2_idx,
+                                                                   type="test" if "Test" in info else None)
+
+                    if start_idx_f.dtype.is_floating_point:
+                        pred_start = start_idx_f.round().clamp(0, self.args.num_times - 1).long()
+                    else:
+                        pred_start = start_idx_f.clamp(0, self.args.num_times - 1).long()
+
+                    if end_idx_f.dtype.is_floating_point:
+                        pred_end = end_idx_f.round().clamp(0, self.args.num_times - 1).long()
+                    else:
+                        pred_end = end_idx_f.clamp(0, self.args.num_times - 1).long()
+
+                    # enforce start <= end
+                    swap = pred_start > pred_end
+                    if swap.any():
+                        tmp = pred_start[swap].clone()
+                        pred_start[swap] = pred_end[swap]
+                        pred_end[swap] = tmp
+
+                    # exact match on indices
+                    exact_match_sum += float(((pred_start == y1_idx) & (pred_end == y2_idx)).float().sum().item())
+
+                    # convert indices -> YEARS (vectorized over the batch with a fast list lookup)
+                    # year_idx_dict: idx -> string year; cast to float
+                    arr = model.idx_to_year
+                    pred_start_years = torch.tensor([float(arr[int(p)]) for p in pred_start.tolist()], device=dev)
+                    pred_end_years = torch.tensor([float(arr[int(p)]) for p in pred_end.tolist()], device=dev)
+                    y1_years = torch.tensor([float(arr[int(i)]) for i in y1_idx.tolist()], device=dev)
+                    y2_years = torch.tensor([float(arr[int(i)]) for i in y2_idx.tolist()], device=dev)
+
+                    # MAE sums
+                    mae_start_sum += float(torch.abs(pred_start_years - y1_years).sum().item())
+                    mae_end_sum += float(torch.abs(pred_end_years - y2_years).sum().item())
+
+                    # ±k accuracy sums
+                    for k in (1, 3, 5, 10):
+                        acc_pm[k] += float((
+                                                   ((pred_start_years - y1_years).abs() <= k) &
+                                                   ((pred_end_years - y2_years).abs() <= k)
+                                           ).float().sum().item())
+
+                    # Interval IoU (inclusive years; +1 to treat years as discrete)
+                    inter_left = torch.max(pred_start_years, y1_years)
+                    inter_right = torch.min(pred_end_years, y2_years)
+                    inter = (inter_right - inter_left + 1).clamp(min=0)
+                    union = (torch.max(pred_end_years, y2_years) - torch.min(pred_start_years, y1_years) + 1)
+                    iou_sum += float((inter / union).sum().item())
+
+            # aggregate
+            exact_match = 100.0 * exact_match_sum / N
+            mae_start = mae_start_sum / N
+            mae_end = mae_end_sum / N
+            iou = iou_sum / N
+            print(f"[INFO] Eval {info!r} exact-match accuracy: {exact_match:.2f}%")
             print(f"[INFO] Eval {info!r} MAE (start year): {mae_start:.2f} years")
             print(f"[INFO] Eval {info!r} MAE (end year): {mae_end:.2f} years")
-
-            # NEW: ±k accuracy
             for k in (1, 3, 5, 10):
-                acc_k = (((pred_start_years - y1_years).abs() <= k) &
-                         ((pred_end_years - y2_years).abs() <= k)).float().mean()
-                print(f"[INFO] Eval {info!r} ±{k}y accuracy: {acc_k * 100:.2f}%")
-
-            # NEW: interval IoU (inclusive years; drop the +1 if you prefer continuous years)
-            inter_left = torch.max(pred_start_years, y1_years)
-            inter_right = torch.min(pred_end_years, y2_years)
-            inter = (inter_right - inter_left + 1).clamp(min=0)
-            union = (torch.max(pred_end_years, y2_years) - torch.min(pred_start_years, y1_years) + 1)
-            iou = (inter / union).mean()
+                print(f"[INFO] Eval {info!r} ±{k}y accuracy: {100.0 * acc_pm[k] / N:.2f}%")
             print(f"[INFO] Eval {info!r} Interval IoU: {iou:.3f}")
 
-            #  return a dict so callers can log it
             return {
-                "exact_match": float((correct * 100.0).item()),
-                "mae_start_years": float(mae_start.item()),
-                "mae_end_years": float(mae_end.item()),
+                "exact_match": exact_match,
+                "mae_start_years": mae_start,
+                "mae_end_years": mae_end,
             }
+
         else:
             #original 6 column path: (h, r, t, time, sent_idx, veracity)
             X6 = X_tensor[:, :6]

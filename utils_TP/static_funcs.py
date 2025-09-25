@@ -304,10 +304,39 @@ def select_model(args) -> Tuple[pl.LightningModule, AnyStr]:
             use_prod=getattr(args, "use_prod", False),
             end_weight=getattr(args, "end_weight", 1.0),
             extra_order_pen=getattr(args, "extra_order_pen", 0.0),
+            emb_noise=getattr(args, "emb_noise", 0.0),
             hidden_dim=256,
             dropout=0.3,
-            lr=1e-3
+            lr=getattr(args, "lr", 1e-3)
         )
+
+        import torch, numpy as np
+
+        def _to_tensor(x, device):
+            if isinstance(x, torch.Tensor):
+                return x.detach().to(device=device, dtype=torch.float32)
+            # covers numpy arrays / lists
+            return torch.as_tensor(x, dtype=torch.float32, device=device)
+
+        device = torch.device("cpu")
+        try:
+            device = next(model.parameters()).device
+        except StopIteration:
+            pass
+
+        E = _to_tensor(args.dataset.emb_entities, device)  # [num_entities, d]
+        R = _to_tensor(args.dataset.emb_relation, device)  # [num_relations, d]
+
+        assert E.shape == model.ent_emb.weight.shape, f"Entity emb shape mismatch: {E.shape} vs {model.ent_emb.weight.shape}"
+        assert R.shape == model.rel_emb.weight.shape, f"Relation emb shape mismatch: {R.shape} vs {model.rel_emb.weight.shape}"
+
+        with torch.no_grad():
+            model.ent_emb.weight.copy_(E)
+            model.rel_emb.weight.copy_(R)
+
+        model.ent_emb.weight.requires_grad = False
+        model.rel_emb.weight.requires_grad = False
+
         form_of_labelling = 'RangePrediction'
     else:
         raise ValueError

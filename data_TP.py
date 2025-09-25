@@ -8,18 +8,31 @@ import os
 
 import random
 
-#my editing ------------
-# allowlist the nn.Embedding class for any weights_only=True load
-# allowlist the nn.Embedding class for any weights_only=True load
-try:
-    torch.serialization.add_safe_globals([
-        torch.nn.modules.sparse.Embedding,
-        torch.nn.Embedding
-    ])
-except AttributeError:
-    # running on a PyTorch version without add_safe_globals; ignore
-    pass
-#my editing ------------
+import re
+
+_Q_RE = re.compile(r"(Q\d+)$")
+_P_RE = re.compile(r"(P\d+)$")
+
+def _strip_brackets_url_lastseg(x: str) -> str:
+    x = x.strip()
+    if x.startswith("<") and x.endswith(">"):
+        x = x[1:-1]
+    return x.rstrip("/").split("/")[-1]
+
+def normalize_ent_id(uri: str) -> str:
+    seg = _strip_brackets_url_lastseg(uri)
+    # Prefer trailing Qxxxx if present; else return last segment as-is
+    m = _Q_RE.search(seg)
+    return m.group(1) if m else seg
+
+def normalize_rel_id(uri: str) -> str:
+    seg = _strip_brackets_url_lastseg(uri)  # e.g., "Property:P729", "P729", "direct/P729"
+    # Drop common prefixes like "Property:"
+    if seg.startswith("Property:"):
+        seg = seg.split(":", 1)[1]
+    # Prefer trailing Pxxxx if present
+    m = _P_RE.search(seg)
+    return m.group(1) if m else seg
 
 
 class Data:
@@ -42,7 +55,37 @@ class Data:
                 self.idx_ent_dict = self.get_ids_dict(selected_dataset_data_dir + "entities")
                 self.idx_rel_dict = self.get_ids_dict(selected_dataset_data_dir + "relations")
                 self.idx_time_dict = self.get_ids_dict(selected_dataset_data_dir + "times")
+
+                # --- widen ENTITY keys so "…/entity/Q####" and "<…>" map to bare "Q####"
+                ent_widen = {}
+                for k, v in list(self.idx_ent_dict.items()):
+                    kk = k.strip("<>")
+                    seg = kk.rstrip("/").split("/")[-1]
+                    if seg != k:
+                        ent_widen[seg] = v
+                self.idx_ent_dict.update(ent_widen)
+
+                # --- widen RELATION keys so any style maps to bare "P####"
+                rel_widen = {}
+                for k, v in list(self.idx_rel_dict.items()):
+                    kk = k.strip("<>")
+                    seg = kk.rstrip("/").split("/")[-1]  # e.g. "Property:P729" or "P729"
+                    # add normalized 'P####' (works for URL, "Property:P####", or bare "P####")
+                    norm = normalize_rel_id(seg)
+                    rel_widen[norm] = v
+                    # also keep "Property:P####" alias in case inputs use it directly
+                    if seg.startswith("Property:"):
+                        rel_widen[seg] = v
+                self.idx_rel_dict.update(rel_widen)
+
+                # DEBUG: show sample keys to confirm
+                print(" [DEBUG] after-widen: ents=", len(self.idx_ent_dict), "rels=", len(self.idx_rel_dict), "times=",
+                      len(self.idx_time_dict))
+                print(" [DEBUG] sample ent keys:", list(self.idx_ent_dict.keys())[:5])
+                print(" [DEBUG] sample rel keys:", list(self.idx_rel_dict.keys())[:5])
+
                 return
+
             # Build maps by scanning raw train/test/valid (URI quintuples)
             train_raw = self.read_raw_lines(os.path.join(selected_dataset_data_dir + "train/", "train"))
             valid_raw = self.read_raw_lines(os.path.join(selected_dataset_data_dir + "valid/", "valid"))
@@ -59,7 +102,9 @@ class Data:
             self.entities = [_last(s) for s, _, o, _, _ in all_raw] + [_last(o) for s, _, o, _, _ in all_raw]
             self.entities = sorted(set(self.entities))
 
-            self.relations = sorted({_last(p) for _, p, _, _, _ in all_raw})
+            self.relations = sorted(set(
+                [normalize_rel_id(p) for _, p, _, _, _ in all_raw]
+            ))
 
             # Persist maps
             with open(selected_dataset_data_dir + "entities", "w") as f:
@@ -74,31 +119,103 @@ class Data:
             self.idx_time_dict = self.get_ids_dict(selected_dataset_data_dir + "times")
 
         def _load_embeddings():
-            # entity.pkl / relation.pkl / time.pkl if present; else CSVs
             import os
-            def _maybe_pkl(name):
-                p = os.path.join(tmp_emb_folder, name)
-                return os.path.exists(p)
-            if _maybe_pkl("entity.pkl"):
+            # helpers
+            def exists(fname):
+                return os.path.exists(os.path.join(tmp_emb_folder, fname))
+
+            # --- Entities ---
+            if exists("entity.npy"):
+                self.emb_entities = self.get_embeddings(tmp_emb_folder, "entity.npy")
+                # if your .npy contains reserved rows at top, trim here (optional)
+                if len(self.emb_entities) != len(self.idx_ent_dict):
+                    extra = len(self.emb_entities) - len(self.idx_ent_dict)
+                    if extra > 0:
+                        print(f"Trimming {extra} extra entity rows from .npy")
+                        self.emb_entities = self.emb_entities[extra:]
+                print(f"[DEBUG] loaded entity.npy: {len(self.emb_entities)} rows")
+            elif exists("entity.pkl"):
                 self.emb_entities = self.get_embeddings(tmp_emb_folder, "entity.pkl")
+                if len(self.emb_entities) != len(self.idx_ent_dict):
+                    extra = len(self.emb_entities) - len(self.idx_ent_dict)
+                    if extra > 0:
+                        print(f"Trimming {extra} extra entity rows from .pkl")
+                        self.emb_entities = self.emb_entities[extra:]
+                print(f"[DEBUG] loaded entity.pkl: {len(self.emb_entities)} rows")
             else:
-                # enforce same order as maps
-                order = [None]*len(self.idx_ent_dict)
-                for iri, idx in self.idx_ent_dict.items():order[idx] = iri
-                self.emb_entities = self.get_embeddings_from_csv(tmp_emb_folder, "all_entities_embeddings_final.csv", order)
-            if _maybe_pkl("relation.pkl"):
+                # CSV requires an order column; enforce map order
+                order = [None] * len(self.idx_ent_dict)
+                for iri, idx in self.idx_ent_dict.items():
+                    order[idx] = iri
+                self.emb_entities = self.get_embeddings_from_csv(tmp_emb_folder, "all_entities_embeddings_final.csv",
+                                                                 order)
+                print(f"[DEBUG] loaded all_entities_embeddings_final.csv: {len(self.emb_entities)} rows")
+
+            # --- Relations ---
+            if exists("relation.npy"):
+                self.emb_relation = self.get_embeddings(tmp_emb_folder, "relation.npy")
+                if len(self.emb_relation) != len(self.idx_rel_dict):
+                    extra = len(self.emb_relation) - len(self.idx_rel_dict)
+                    if extra > 0:
+                        print(f"Trimming {extra} extra relation rows from .npy")
+                        self.emb_relation = self.emb_relation[extra:]
+                print(f"[DEBUG] loaded relation.npy: {len(self.emb_relation)} rows")
+            elif exists("relation.pkl"):
                 self.emb_relation = self.get_embeddings(tmp_emb_folder, "relation.pkl")
+                if len(self.emb_relation) != len(self.idx_rel_dict):
+                    extra = len(self.emb_relation) - len(self.idx_rel_dict)
+                    if extra > 0:
+                        print(f"Trimming {extra} extra relation rows from .pkl")
+                        self.emb_relation = self.emb_relation[extra:]
+                print(f"[DEBUG] loaded relation.pkl: {len(self.emb_relation)} rows")
             else:
-                order = [None]*len(self.idx_rel_dict)
-                for iri, idx in self.idx_rel_dict.items():order[idx] = iri
-                self.emb_relation = self.get_embeddings_from_csv(tmp_emb_folder, "all_relations_embeddings_final.csv", order)
-            # time embeddings optional
-            self.emb_times = self.get_embeddings(tmp_emb_folder, "time.pkl") if _maybe_pkl("time.pkl") else []
+                order = [None] * len(self.idx_rel_dict)
+                for iri, idx in self.idx_rel_dict.items():
+                    order[idx] = iri
+                self.emb_relation = self.get_embeddings_from_csv(tmp_emb_folder, "all_relations_embeddings_final.csv",
+                                                                 order)
+                print(f"[DEBUG] loaded all_relations_embeddings_final.csv: {len(self.emb_relation)} rows")
+
+            # --- Times (optional) ---
+            if exists("time.npy"):
+                self.emb_times = self.get_embeddings(tmp_emb_folder, "time.npy")
+                print(f"[DEBUG] loaded time.npy: {len(self.emb_times)} rows")
+            elif exists("time.pkl"):
+                self.emb_times = self.get_embeddings(tmp_emb_folder, "time.pkl")
+                print(f"[DEBUG] loaded time.pkl: {len(self.emb_times)} rows")
+            else:
+                self.emb_times = []
+
             self.num_entities = len(self.emb_entities)
             self.num_relations = len(self.emb_relation)
-            # for range, num_times should come from the time ID map
-            self.num_times = len(self.idx_time_dict)
-        #TODO to be deleted and generalized it's logic later
+            self.num_times = len(self.idx_time_dict)  # range task uses buckets, not emb_times
+
+        def _probe_split_for_misses(path, max_print=5):
+            missing_h = missing_r = missing_t = 0
+            ex_h, ex_r, ex_t = [], [], []
+            lines = self.read_raw_lines(path)
+            for ln in lines:
+                parts = ln.split('\t')
+                if len(parts) != 5:
+                    continue
+                h, r, t, y1, y2 = parts
+                h_id = normalize_ent_id(h)
+                r_id = normalize_rel_id(r)
+                t_id = normalize_ent_id(t)
+                if h_id not in self.idx_ent_dict and len(ex_h) < max_print:
+                    ex_h.append(h_id);
+                    missing_h += 1
+                if r_id not in self.idx_rel_dict and len(ex_r) < max_print:
+                    ex_r.append(r_id);
+                    missing_r += 1
+                if t_id not in self.idx_ent_dict and len(ex_t) < max_print:
+                    ex_t.append(t_id);
+                    missing_t += 1
+            print(f"[DEBUG] Probe {path}: missing_h={missing_h}, missing_r={missing_r}, missing_t={missing_t}")
+            if ex_h: print("  e.g. missing h:", ex_h)
+            if ex_r: print("  e.g. missing r:", ex_r)
+            if ex_t: print("  e.g. missing t:", ex_t)
+
         ids_only = args.ids_only
 
 
@@ -110,6 +227,19 @@ class Data:
             _ensure_id_maps()           # <-- maps exist before reading ranges
             _load_embeddings()          # <-- and embeddings too
             print("[DEBUG] Loading range-prediction 5-tuple dataset format...")
+
+            print(" [DEBUG] map sizes:",
+                  "ents=", len(self.idx_ent_dict),
+                  "rels=", len(self.idx_rel_dict),
+                  "times=", len(self.idx_time_dict))
+            print(" [DEBUG] sample rel keys:", list(self.idx_rel_dict.keys())[:5])
+
+            valid_path = os.path.join(selected_dataset_data_dir, "valid", "valid")
+            train_path = os.path.join(selected_dataset_data_dir, "train", "train")
+            test_path = os.path.join(selected_dataset_data_dir, "test", "test")
+            _probe_split_for_misses(train_path)
+            _probe_split_for_misses(valid_path)
+            _probe_split_for_misses(test_path)
 
             #step1: read all files just to get triples
             #train_raw = self.read_raw_lines(selected_dataset_data_dir + "train/train")
@@ -226,25 +356,20 @@ class Data:
             #    self.idx_time_dict[i] = len(self.idx_time_dict)
 
             #-----------------my editing-----------------
+            # Entities
             for uri in self.entities:
-                s = str(uri)
-                #strip angle brackets if present
-                if s.startswith("<") and s.endswith(">"):
-                    s = s[1:-1]
-                #take the last segment after "/", e.g. "Q112620158" or "Ashok_Bhadra"
-                ent_id = s.rstrip("/").split("/")[-1]
+                ent_id = normalize_ent_id(str(uri))
                 self.idx_ent_dict[ent_id] = len(self.idx_ent_dict)
 
+            # Relations
             for uri in self.relations:
-                s = str(uri)
-                if s.startswith("<") and s.endswith(">"):
-                    s = s[1:-1]
-                rel_id = s.rstrip("/").split("/")[-1]
+                rel_id = normalize_rel_id(str(uri))
                 self.idx_rel_dict[rel_id] = len(self.idx_rel_dict)
 
+            # Times
             for t in self.times:
-                #times are already sample (e.g. "1984" or "1984.0")
-                self.idx_time_dict[t] = len(self.idx_time_dict)
+                # keep as strings of integer years
+                self.idx_time_dict[str(int(float(t)))] = len(self.idx_time_dict)
 
             # -----------------my editing-----------------
 
@@ -687,25 +812,76 @@ class Data:
         idx_data = []
         for line in raw_lines:
             try:
-                parts = line.split('\t')  # Assuming tab-separated data
+                parts = line.split('\t')  # tab-separated: h  r  t  y1  y2
                 if len(parts) != 5:
                     print(f"[WARNING] Skipping malformed line (expected 5 columns): {line}")
                     continue
+
                 h, r, t, y1, y2 = parts
-                h_idx = self.idx_ent_dict.get(h)
-                r_idx = self.idx_rel_dict.get(r)
-                t_idx = self.idx_ent_dict.get(t)
-                y1_idx = self.idx_time_dict.get(str(int(float(y1))))  # Convert to int to match mapping
-                y2_idx = self.idx_time_dict.get(str(int(float(y2))))  # Convert to int to match mapping
+
+                # strip to last segment (works for both <...> and plain URLs)
+                def last_seg(x):
+                    x = x.strip()
+                    if x.startswith("<") and x.endswith(">"):
+                        x = x[1:-1]
+                    return x.rstrip("/").split("/")[-1]
+
+                import re
+
+                def norm_ent(x: str) -> str:
+                    # works for <...>, http(s)://.../entity/Qxxx, dbpedia/.../resource/...
+                    x = x.strip()
+                    if x.startswith("<") and x.endswith(">"):
+                        x = x[1:-1]
+                    seg = x.rstrip("/").split("/")[-1]
+                    # prefer bare Qxxxx at the end if present
+                    m = re.search(r"(Q\d+)$", seg)
+                    return m.group(1) if m else seg
+
+                def norm_rel(x: str) -> str:
+                    x = x.strip()
+                    if x.startswith("<") and x.endswith(">"):
+                        x = x[1:-1]
+                    seg = x.rstrip("/").split("/")[-1]  # e.g., "Property:P729" or "P729"
+                    # strip "Property:" if present
+                    if seg.startswith("Property:"):
+                        seg = seg.split(":", 1)[1]
+                    # fallback: extract trailing Pxxxx if embedded
+                    m = re.search(r"(P\d+)$", seg)
+                    return m.group(1) if m else seg
+
+                h_id = normalize_ent_id(h)
+                r_id = normalize_rel_id(r)
+                t_id = normalize_ent_id(t)
+
+                h_idx = self.idx_ent_dict.get(h_id)
+                r_idx = self.idx_rel_dict.get(r_id)
+                t_idx = self.idx_ent_dict.get(t_id)
+
+                y1_idx = self.idx_time_dict.get(str(int(float(y1))))
+                y2_idx = self.idx_time_dict.get(str(int(float(y2))))
+
                 if None in (h_idx, r_idx, t_idx, y1_idx, y2_idx):
-                    print(
-                        f"[WARNING] Missing index for line: {line} (h_idx={h_idx}, r_idx={r_idx}, t_idx={t_idx}, y1_idx={y1_idx}, y2_idx={y2_idx})")
+                    print(f"[WARNING] Missing index for line: {line} -> "
+                          f"(h={h_id}:{h_idx}, r={r_id}:{r_idx}, t={t_id}:{t_idx}, y1={y1}:{y1_idx}, y2={y2}:{y2_idx})")
                     continue
+
                 idx_data.append([h_idx, r_idx, t_idx, y1_idx, y2_idx])
+
             except Exception as e:
                 print(f"[ERROR] Failed to process line {line}: {e}")
                 continue
+
         print(f"[DEBUG] Loaded {len(idx_data)} entries from {file_path}")
+
+        # DEBUG coverage summary
+        try:
+            total = len(raw_lines)
+            print(
+                f"[DEBUG] Coverage for {file_path}: kept={len(idx_data)} / raw={total}  ({(len(idx_data) / max(1, total)) * 100:.2f}%)")
+        except Exception:
+            pass
+
         return idx_data
 
         ''' dataset = []
@@ -1032,7 +1208,17 @@ class Data:
         return test_data, valid_data
 
     def get_ids_dict(self, dict_file_path):
-        ids_dict = {}
+        """
+        Parse mapping files that are either:
+          - ID <TAB> URI   (old)
+          - URI <TAB> ID   (new)
+        and return a dict: {uri_or_year_str: int_index}.
+
+        Works for entities, relations, and times. For times (both tokens numeric),
+        it picks the orientation where the chosen 'index' side looks like a small
+        index set (min>=0 and max << unique_count*10).
+        """
+        pairs = []
         with open(dict_file_path, "r") as f:
             for line in f:
                 line = line.strip()
@@ -1041,13 +1227,92 @@ class Data:
                 parts = line.split()
                 if len(parts) != 2:
                     continue
-                idx_text, iri = parts
+                a, b = parts
+                pairs.append((a, b))
+
+        def _is_iri_token(tok: str) -> bool:
+            # Heuristics: Q#### / P#### / URL / has non-digit chars
+            if "http" in tok or "entity/" in tok or "Property:" in tok:
+                return True
+            if re.search(r"(Q\d+|P\d+)$", tok):
+                return True
+            return not tok.lstrip("+-").isdigit()
+
+        # Try to detect orientation from first few lines
+        sample = pairs[:50] if len(pairs) > 50 else pairs
+
+        # Case A: old style (ID, URI)
+        a_looks_idx = 0
+        a_idx_max = -1
+        for a, b in sample:
+            if a.lstrip("+-").isdigit() and _is_iri_token(b):
+                a_looks_idx += 1
+                a_idx_max = max(a_idx_max, int(a))
+        # Case B: new style (URI, ID)
+        b_looks_idx = 0
+        b_idx_max = -1
+        for a, b in sample:
+            if b.lstrip("+-").isdigit() and _is_iri_token(a):
+                b_looks_idx += 1
+                b_idx_max = max(b_idx_max, int(b))
+
+        orientation = None
+        if b_looks_idx > a_looks_idx:
+            orientation = "URI_TAB_ID"  # new
+        elif a_looks_idx > b_looks_idx:
+            orientation = "ID_TAB_URI"  # old
+        else:
+            # Times or ambiguous: both sides numeric or mixed.
+            # Prefer the orientation where the 'index' side looks like small indices.
+            # Compute simple stats.
+            a_nums = [int(a) for a, b in sample if a.lstrip("+-").isdigit()]
+            b_nums = [int(b) for a, b in sample if b.lstrip("+-").isdigit()]
+            # Heuristic: smaller max likely to be the index column
+            if a_nums and b_nums:
+                orientation = "ID_TAB_URI" if (max(a_nums) <= max(b_nums)) else "URI_TAB_ID"
+            else:
+                # default to old if uncertain
+                orientation = "ID_TAB_URI"
+
+        ids_dict = {}
+        if orientation == "ID_TAB_URI":
+            # first token is index, second is iri/year
+            for a, b in pairs:
+                if not a.lstrip("+-").isdigit():
+                    continue
                 try:
-                    idx = int(idx_text)
+                    idx = int(a)
                 except ValueError:
                     continue
+                iri = b
                 ids_dict[iri] = idx
+        else:
+            # first token is iri/year, second is index
+            for a, b in pairs:
+                if not b.lstrip("+-").isdigit():
+                    continue
+                try:
+                    idx = int(b)
+                except ValueError:
+                    continue
+                iri = a
+                ids_dict[iri] = idx
+
+        # Optional: normalize common IRI forms to widen matches
+        # (entities: Q####; relations: P####; times: keep as-is but ensure string keys)
+        widened = {}
+        for k, v in list(ids_dict.items()):
+            kk = k.strip("<>")
+            seg = kk.rstrip("/").split("/")[-1]
+            widened[seg] = v  # adds 'Q####' or 'P####' or raw year string
+            if seg.startswith("Property:"):
+                widened[seg.split(":", 1)[1]] = v  # also add bare P####
+        ids_dict.update(widened)
+
+        # Ensure time keys are strings (loader uses str(int(float(year))) for lookup)
+        # If this is the 'times' file, both tokens were numeric; leaving string keys is safest.
         return ids_dict
+
     #    ids_dict = dict()
     #    data = []
     #    with open("%s" % (dict_file_path), "r") as f:
@@ -1330,60 +1595,41 @@ class Data:
 
         #return sorted_df.iloc[:, 1:]
         return sorted_df.drop([first_col, 'key'], axis=1).reset_index(drop=True)
-    @staticmethod
-    def get_embeddings(path,name):
-        # embeddings = dict()
-        # print("%s%s.txt" % (path,name))
-        if name.endswith(".pkl"):
-            #my editing -------------------------
 
-            import pickle
-            # 1) Try safe, weights-only load
-            try:
-                emb_obj = torch.load(f"{path}{name}",map_location=torch.device('cpu'),weights_only=True)
-            except (TypeError, pickle.UnpicklingError):
-            # 2) Fallback to full load on trusted files
-                print(f"⚠️  weights_only load failed for {name}; retrying full load")
-                emb_obj = torch.load(f"{path}{name}",map_location=torch.device('cpu'),weights_only=False)
-            # 3) Unwrap if it’s an Embedding module
-            if isinstance(emb_obj, torch.nn.Embedding):
-                embd = emb_obj.weight
+    @staticmethod
+    def get_embeddings(path, name):
+        import os
+        full = f"{path}{name}"
+        if name.endswith(".npy"):
+            import numpy as np
+            arr = np.load(full)  # shape [N, d]
+            return arr  # keep as numpy; callers handle conversion / alignment
+        if name.endswith(".pkl"):
+            import inspect, torch
+            load_kwargs = {"map_location": torch.device("cpu")}
+            if "weights_only" in inspect.signature(torch.load).parameters:
+                try:
+                    load_kwargs["weights_only"] = True
+                    emb_obj = torch.load(full, **load_kwargs)
+                except Exception:
+                    load_kwargs.pop("weights_only", None)
+                    emb_obj = torch.load(full, **load_kwargs)
             else:
-            # covers bare Parameter or raw tensor
-                embd = emb_obj
-            #embd = torch.load("%s%s" % (path,name),map_location=torch.device('cpu'))
-            # old_data = pickle.load(file)
-            # with open("%s%s" % (path,name), 'rb') as f:
-            #   data = pickle.load(f)
-            return embd
-        elif name.endswith(".csv"):
-            embd = pd.read_csv("%s%s" % (path,name), sep=",")
+                emb_obj = torch.load(full, **load_kwargs)
+            if isinstance(emb_obj, torch.nn.Embedding):
+                return emb_obj.weight
+            if isinstance(emb_obj, torch.nn.Parameter):
+                return emb_obj.data
+            return emb_obj  # tensor/np/list
+        if name.endswith(".csv"):
+            import pandas as pd
+            embd = pd.read_csv(full, sep=",")
             last_column_name = embd.columns[-1]
             if str(embd[last_column_name]).__contains__("]"):
                 embd[last_column_name] = embd[last_column_name].str.replace(']', '', regex=False)
             return embd.iloc[:, 1:]
-        else:
-            print("invalid embeddings format. Please use .csv or .pkl fomat")
-            raise ValueError
-
-
-        # for emb in idxs:
-        #     if emb not in embeddings.keys():
-        #         print("this is missing in embeddings file:"+ emb)
-        #         exit(1)
-        #
-        # if len(idxs) > len(embeddings):
-        #     print("embeddings missing")
-        #     exit(1)
-        # embeddings_final = dict()
-        # for emb in idxs.keys():
-        #     if emb in embeddings.keys():
-        #         embeddings_final[emb] = embeddings[emb]
-        #     else:
-        #         print('no embedding', emb)
-        #         exit(1)
-
-        return embd.weight
+        print("invalid embeddings format. Please use .npy, .csv or .pkl format")
+        raise ValueError
 
     @staticmethod
     def get_comma_seperated_embeddings(idxs, path, name):
