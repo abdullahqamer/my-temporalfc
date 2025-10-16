@@ -163,5 +163,3 @@ If you use this repo, please also cite the original works.
 
 This repository reuses parts of TemporalFC. Please refer to the upstream license and include attribution when publishing results based on this code.
 
-```
-```
