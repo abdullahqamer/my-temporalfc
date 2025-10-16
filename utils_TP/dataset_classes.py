@@ -225,6 +225,14 @@ class TimePredictionDataset(Dataset):
         self.tail_idx = triples[:, 2]
         self.y1_idx = triples[:, 3]
         self.y2_idx = triples[:, 4]
+
+        # enforce y1 <= y2 for training targets
+        swap = self.y1_idx > self.y2_idx
+        if swap.any():
+            y1c = self.y1_idx.clone()
+            self.y1_idx[swap] = self.y2_idx[swap]
+            self.y2_idx[swap] = y1c[swap]
+
         self.length = len(triples)
         self.num_entities = num_entities
         self.num_relations = num_relations

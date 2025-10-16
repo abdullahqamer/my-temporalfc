@@ -47,8 +47,24 @@ def argparse_default(description=None):
                         help="Number of Optuna trials; 0 disables tuning")
     parser.add_argument("--optuna_timeout", type=int, default=0,
                         help="Global timeout in seconds for Optuna (0 = no timeout)")
-
-
+    parser.add_argument("--hidden_dim", type=int, default=1024,
+                        help="Hidden width of the MLP trunk (e.g., 512, 1024).")
+    parser.add_argument("--dropout", type=float, default=0.10,
+                        help="Dropout prob used in the trunk.")
+    parser.add_argument("--gauss_sigma_idx", type=float, default=1.25,
+                        help="Gaussian width (in index units) for CE targets.")
+    parser.add_argument("--t_dim", type=int, default=None)
+    parser.add_argument("--num_experts", type=int, default=None)
+    parser.add_argument("--k_experts", type=int, default=None)
+    parser.add_argument("--gate_temp_start", type=float, default=None)
+    parser.add_argument("--gate_balance", type=float, default=None)
+    parser.add_argument("--run_optuna", type=int, default=0,
+                        help="Set to 1 to run Optuna sweep instead of normal training.")
+    # === bands / duration-prior flags ===
+    parser.add_argument("--use_bands", type=int, default=0, help="Enable per-relation year bands (1/0)")
+    parser.add_argument("--use_prior", type=int, default=0, help="Enable relation-wise duration prior (1/0)")
+    parser.add_argument("--band_margin", type=float, default=1.5, help="Observed band margin in index units")
+    parser.add_argument("--prior_weight", type=float, default=0.0, help="Loss weight for duration prior")
 
     #parser.add_argument("--path_train_dataset", type=str, required=True, help="data_TP/dbpedia124k/")
     # Paths.
@@ -97,7 +113,7 @@ def argparse_default(description=None):
     parser.add_argument('--val_batch_size', type=int, default=1000)
     # parser.add_argument('--negative_sample_ratio', type=int, default=0)
     parser.add_argument('--num_workers', type=int, default=1, help='Number of cpus used during batching')
-    parser.add_argument("--check_val_every_n_epochs", type=int, default=10)
+    parser.add_argument("--check_val_every_n_epochs", type=int, default=1)
     # parser.add_argument('--enable_checkpointing', type=bool, default=True)
     # parser.add_argument('--deterministic', type=bool, default=True)
     # parser.add_argument('--fast_dev_run', type=bool, default=False)
@@ -128,14 +144,44 @@ def run_optuna(args):
     def objective(trial):
         targs = copy.deepcopy(args)
 
+        # ========= NEW / EXPANDED SUGGESTIONS =========
+
+        # model capacity that your select_model already passes:
+        targs.hidden_dim = trial.suggest_categorical("hidden_dim", [512, 1024])
+        targs.dropout = trial.suggest_float("dropout", 0.10, 0.18)
+
+        # === MoE + calendar knobs ===
+        targs.t_dim = int(trial.suggest_categorical("t_dim", [64, 96, 128]))
+        targs.num_experts = int(trial.suggest_categorical("num_experts", [3, 4, 5]))
+        targs.k_experts = int(trial.suggest_categorical("k_experts", [1, 2, 3]))
+        if targs.k_experts > targs.num_experts:
+            targs.k_experts = targs.num_experts  # safety
+
+        targs.gate_temp_start = float(trial.suggest_float("gate_temp_start", 1.2, 2.0))
+        targs.gate_balance = float(trial.suggest_float("gate_balance", 0.01, 0.05))
+
+        # already used by your training_step (scalar CE sigma):
+        targs.gauss_sigma_idx = trial.suggest_float("gauss_sigma_idx", 1.10, 1.60)
+
+        # regularizers you already wire:
+        targs.emb_noise = trial.suggest_float("emb_noise", 0.00, 0.015)
+
+        # (Optional toggles, default OFF in your best recipe; let Optuna test)
+        targs.use_bands = trial.suggest_categorical("use_bands", [0, 1])
+        targs.use_prior = trial.suggest_categorical("use_prior", [0, 1])
+
+        # only meaningful if bands/prior are ON; still safe to set:
+        targs.band_margin = trial.suggest_float("band_margin", 0.8, 2.0)
+        targs.prior_weight = trial.suggest_float("prior_weight", 0.02, 0.06)
+
         # --- sampled hyperparams ---
         targs.lr = trial.suggest_float("lr", 7e-4, 2e-3, log=True)
         targs.loss_type = "huber"
-        targs.huber_beta = trial.suggest_float("huber_beta", 0.35, 0.9)
-        targs.end_weight = trial.suggest_float("end_weight", 0.8, 1.4)
+        targs.huber_beta = trial.suggest_float("huber_beta", 0.60, 1.00)
+        targs.end_weight = trial.suggest_float("end_weight", 0.85, 1.4)
         targs.extra_order_pen = trial.suggest_float("extra_order_pen", 0.02, 0.12)
-        targs.use_interaction = False
-        targs.use_prod        = True
+        targs.use_interaction = trial.suggest_categorical("use_interaction", [0, 1])
+        targs.use_prod        = trial.suggest_categorical("use_prod", [0, 1])
 
         # --- keep trials short (set BEFORE creating Execute_TP) ---
         targs.max_num_epochs = min(getattr(args, "max_num_epochs", 100), 60)
@@ -150,7 +196,7 @@ def run_optuna(args):
 
     # optional: make results reproducible
     sampler = optuna.samplers.TPESampler(seed=42)
-    study = optuna.create_study(direction="minimize", sampler=sampler)
+    study = optuna.create_study(direction="maximize", sampler=sampler)
     study.optimize(
         objective,
         n_trials=args.optuna_trials,

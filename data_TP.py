@@ -49,14 +49,24 @@ class Data:
         tmp_emb_folder = os.path.join(selected_dataset_data_dir, "embeddings", emb_typ, "")
 
         def _ensure_id_maps():
-            # Try to load existing maps; otherwise build from raw triples once.
-            maps_exist = all(os.path.exists(selected_dataset_data_dir + f) for f in ["entities", "relations", "times"])
-            if maps_exist:
-                self.idx_ent_dict = self.get_ids_dict(selected_dataset_data_dir + "entities")
-                self.idx_rel_dict = self.get_ids_dict(selected_dataset_data_dir + "relations")
-                self.idx_time_dict = self.get_ids_dict(selected_dataset_data_dir + "times")
+            import os
+            # prefer new *map.tsv names if present, otherwise fallback to legacy names
+            def choose(path_no_ext, tsv_name):
+                p1 = os.path.join(selected_dataset_data_dir, tsv_name)
+                p0 = os.path.join(selected_dataset_data_dir, path_no_ext)  # legacy (no ext)
+                return p1 if os.path.exists(p1) else p0
 
-                # --- widen ENTITY keys so "…/entity/Q####" and "<…>" map to bare "Q####"
+            ent_map_path = choose("entities", "entities_map.tsv")
+            rel_map_path = choose("relations", "relations_map.tsv")
+            tim_map_path = choose("times", "times_map.tsv")
+
+            maps_exist = all(os.path.exists(p) for p in [ent_map_path, rel_map_path, tim_map_path])
+            if maps_exist:
+                self.idx_ent_dict = self.get_ids_dict(ent_map_path)
+                self.idx_rel_dict = self.get_ids_dict(rel_map_path)
+                self.idx_time_dict = self.get_ids_dict(tim_map_path)
+
+                # widen entity/rel keys so “<…/Q####>”, URLs, or bare IDs all resolve
                 ent_widen = {}
                 for k, v in list(self.idx_ent_dict.items()):
                     kk = k.strip("<>")
@@ -65,25 +75,20 @@ class Data:
                         ent_widen[seg] = v
                 self.idx_ent_dict.update(ent_widen)
 
-                # --- widen RELATION keys so any style maps to bare "P####"
                 rel_widen = {}
                 for k, v in list(self.idx_rel_dict.items()):
                     kk = k.strip("<>")
-                    seg = kk.rstrip("/").split("/")[-1]  # e.g. "Property:P729" or "P729"
-                    # add normalized 'P####' (works for URL, "Property:P####", or bare "P####")
-                    norm = normalize_rel_id(seg)
+                    seg = kk.rstrip("/").split("/")[-1]
+                    norm = normalize_rel_id(seg)  # ensures bare P####
                     rel_widen[norm] = v
-                    # also keep "Property:P####" alias in case inputs use it directly
                     if seg.startswith("Property:"):
                         rel_widen[seg] = v
                 self.idx_rel_dict.update(rel_widen)
 
-                # DEBUG: show sample keys to confirm
-                print(" [DEBUG] after-widen: ents=", len(self.idx_ent_dict), "rels=", len(self.idx_rel_dict), "times=",
-                      len(self.idx_time_dict))
+                print(" [DEBUG] after-widen: ents=", len(self.idx_ent_dict),
+                      "rels=", len(self.idx_rel_dict), "times=", len(self.idx_time_dict))
                 print(" [DEBUG] sample ent keys:", list(self.idx_ent_dict.keys())[:5])
                 print(" [DEBUG] sample rel keys:", list(self.idx_rel_dict.keys())[:5])
-
                 return
 
             # Build maps by scanning raw train/test/valid (URI quintuples)
@@ -133,6 +138,8 @@ class Data:
                     if extra > 0:
                         print(f"Trimming {extra} extra entity rows from .npy")
                         self.emb_entities = self.emb_entities[extra:]
+                        if len(set(self.idx_ent_dict.values())) != len(self.emb_entity):
+                            raise SystemExit("[FATAL] unique entity IDs != entity.npy rows")
                 print(f"[DEBUG] loaded entity.npy: {len(self.emb_entities)} rows")
             elif exists("entity.pkl"):
                 self.emb_entities = self.get_embeddings(tmp_emb_folder, "entity.pkl")
@@ -159,6 +166,13 @@ class Data:
                     if extra > 0:
                         print(f"Trimming {extra} extra relation rows from .npy")
                         self.emb_relation = self.emb_relation[extra:]
+                        uniq_rel_ids = len(set(self.idx_rel_dict.values()))
+                        if uniq_rel_ids != len(self.emb_relation):
+                            raise SystemExit(
+                                f"[FATAL] unique relation IDs in map={uniq_rel_ids} "
+                                f"but relation embedding rows={len(self.emb_relation)}. "
+                                f"Load the matching file (e.g., relation5.npy) or fix the map."
+                            )
                 print(f"[DEBUG] loaded relation.npy: {len(self.emb_relation)} rows")
             elif exists("relation.pkl"):
                 self.emb_relation = self.get_embeddings(tmp_emb_folder, "relation.pkl")
@@ -265,9 +279,37 @@ class Data:
             print(f"[DEBUG] Test entries: {len(self.idx_test_set)}")
             print(f"[DEBUG] Valid entries: {len(self.idx_valid_set)}")
 
-            '''self.paired_train_idx = self.idx_train_set
-            self.paired_test_idx = self.idx_test_set
-            self.paired_valid_idx = self.idx_valid_set'''
+            # === Per-relation priors (midpoint & duration) from TRAIN, in index space ===
+            import numpy as np
+            # self.idx_train_set rows are [s_idx, r_idx, t_idx, y1_idx, y2_idx]
+            train_arr = np.asarray(self.idx_train_set, dtype=np.int64)
+            r_train = train_arr[:, 1]
+            y1 = train_arr[:, 3].astype(np.float32)
+            y2 = train_arr[:, 4].astype(np.float32)
+            mid = 0.5 * (y1 + y2)
+            dur = np.maximum(0.0, y2 - y1)
+
+            R = len(self.idx_rel_dict.values())  # number of (unique id) relations; safer to use:
+            R = len(set(self.idx_rel_dict.values()))
+
+            prior_m = np.zeros((R,), dtype=np.float32)
+            prior_d = np.zeros((R,), dtype=np.float32)
+            for rid in range(R):
+                mask = (r_train == rid)
+                if not mask.any():
+                    # fallback: global median if rid unseen in train
+                    prior_m[rid] = float(np.median(mid))
+                    prior_d[rid] = float(np.median(dur))
+                else:
+                    prior_m[rid] = float(np.median(mid[mask]))
+                    prior_d[rid] = float(np.median(dur[mask]))
+
+            # store for the model
+            self.relation_prior_mid_idx = prior_m  # float array length R (indices)
+            self.relation_prior_dur_idx = prior_d  # float array length R (indices)
+
+            print(f"[DEBUG] per-relation priors (index): mid[0..4]={prior_m[:5]}, dur[0..4]={prior_d[:5]}")
+
 
 
         #if args.model == "KGE-only":
@@ -394,11 +436,6 @@ class Data:
             self.num_times = 0
             if str(args.model).__contains__("temporal"):
                 self.num_times = len(self.emb_time)
-
-            #for range prediction we need the count of time buckets, not emb_time
-            if str(args.model).lower() == "range-lstm":
-                self.num_times = len(self.idx_time_dict)
-                print(f"[DEBUG] Override num_times --> {self.num_times} (size of idx_time_dict)")
 
             if args.negative_triple_generation =="corrupted-time-based": # we have to duplicate the sentences because only time is currupted in this case..
                 # TODO for later
@@ -743,7 +780,6 @@ class Data:
             if os.path.exists(time_pkl):
                 self.emb_time = self.get_embeddings(tmp_emb_folder + emb_typ + '/', 'time.pkl')
             else:
-                # if you never use emb_time in range-lstm you can just set it empty
                 self.emb_time = []
 
             # DEBUG: print out the exact counts
@@ -788,9 +824,6 @@ class Data:
             # ————————————————————————————————————————————————
             # -------------MY EDITITNG-------------------------
 
-        print(" In Data.__intit__: paired_train_idx exists?", hasattr(self, "paired_train_idx"))
-        print(" paired_valid_idx exists?", hasattr(self, "paired_valid_idx"))
-        print(" paired_test_idx exists?", hasattr(self, "paired_test_idx"))
     # Function to find a key by its value in a dictionary
 
     def load_id_split(self, file_path):

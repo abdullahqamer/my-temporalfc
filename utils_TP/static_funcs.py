@@ -19,8 +19,6 @@ from nn_models_TP.text_KGE_hybrid_model import TextKGEHybridModel
 from nn_models_TP.text_model import TextModel
 from nn_models_TP.text_path_hybrid_model import TextPathHybridModel
 
-from nn_models_TP.range_lstm_model import RangeLSTMModel
-
 
 
 
@@ -119,18 +117,13 @@ def sanity_checking_with_arguments(args):
                 print(f'For fact-checkingl task you must specify a negative triple generation method!')
                 raise
         elif str(args.task).lower() == "time-prediction":
-            allowed = {'temporal-prediction-model', 'temporal-lstm'}
+            allowed = {'temporal-prediction-model'}
             if str(args.model).lower() not in allowed:
                 print(
                     f"For time-prediction task you must choose one of {allowed}.\n"
                     f"You passed: {args.model}"
                 )
                 raise AssertionError
-            #try:
-             #   assert args.model == "temporal_lstm"
-            #except AssertionError:
-             #   print(f'For time-prediction task you can chose the temporal-prediction-model only!!')
-              #  raise
         elif str(args.task).lower() == "range-prediction":
             try:
                 assert args.model == "range-mlp"
@@ -262,33 +255,6 @@ def select_model(args) -> Tuple[pl.LightningModule, AnyStr]:
     elif str(args.model).lower() == 'kge-path-hybrid':
         form_of_labelling = 'FactChecking'
         model = PathKGEHybridModel(args=args)
-    elif str(args.model).lower() == 'temporal-lstm':
-        form_of_labelling = 'TimePrediction'
-        from nn_models_TP.temporal_lstm_model import TemporalLSTMModel
-        model = TemporalLSTMModel(
-            num_entities=args.num_entities,
-            num_relations=args.num_relations,
-            num_times=args.num_times,
-            embedding_dim=args.embedding_dim,
-            lstm_hidden_dim=getattr(args, 'lstm_hidden_dim', 128),
-            num_layers=getattr(args, 'num_layers', 1),
-            dropout=getattr(args, 'dropout', 0.2),
-            lr=getattr(args, 'learning_rate', 1e-3),
-        )
-    elif str(args.model).lower() == 'range-lstm':
-        print(f"[DEBUG] Instantiating RangeLSTMModel with params:", args.num_entities, args.num_relations, args.num_times, args.embedding_dim)
-        from nn_models_TP.range_lstm_model import RangeLSTMModel
-        model = RangeLSTMModel(
-            num_entities=args.num_entities,
-            num_relations=args.num_relations,
-            num_times=args.num_times,
-            embedding_dim=args.embedding_dim,
-            lstm_hidden_dim=getattr(args, 'lstm_hidden_dim', 128),
-            num_layers=getattr(args, 'num_layers', 1),
-            dropout=getattr(args, 'dropout', 0.2),
-            lr=getattr(args, 'learning_rate', 1e-3),
-        )
-        form_of_labelling = 'RangePrediction'
 
     elif str(args.model).lower() == 'range-mlp':
         from nn_models_TP.range_mlp_model import RangeMLPModel
@@ -301,13 +267,24 @@ def select_model(args) -> Tuple[pl.LightningModule, AnyStr]:
             use_interaction=args.use_interaction,
             loss_type=args.loss_type,
             huber_beta=args.huber_beta,
+            #relation_prior_mid_idx=args.dataset.relation_prior_mid_idx,
+            #relation_prior_dur_idx=args.dataset.relation_prior_dur_idx,
             use_prod=getattr(args, "use_prod", False),
             end_weight=getattr(args, "end_weight", 1.0),
             extra_order_pen=getattr(args, "extra_order_pen", 0.0),
             emb_noise=getattr(args, "emb_noise", 0.0),
-            hidden_dim=256,
-            dropout=0.3,
-            lr=getattr(args, "lr", 1e-3)
+            hidden_dim=getattr(args, "hidden_dim", 1024),
+            dropout=getattr(args, "dropout", 0.10),
+            # === NEW: MoE + calendar knobs ===
+            t_dim=(args.t_dim if args.t_dim is not None else 128),
+            num_experts=(args.num_experts if args.num_experts is not None else 4),
+            k_experts=(args.k_experts if args.k_experts is not None else 2),
+            gate_temp_start=(args.gate_temp_start if args.gate_temp_start is not None else 1.6),
+            gate_temp_end=0.8,  # fixed end temp we anneal to
+            gate_balance=(args.gate_balance if args.gate_balance is not None else 0.03),
+            lr=getattr(args, "lr", 1e-3),
+            #rel_text_json = getattr(args, "rel_text_json", None),
+            #idx_rel_dict = getattr(args.dataset, "idx_rel_dict", None),
         )
 
         import torch, numpy as np
@@ -336,6 +313,17 @@ def select_model(args) -> Tuple[pl.LightningModule, AnyStr]:
 
         model.ent_emb.weight.requires_grad = False
         model.rel_emb.weight.requires_grad = False
+
+        # === wire CLI flags into the RangeMLPModel instance ===
+        # bands / prior
+        model.use_bands = bool(getattr(args, "use_bands", 0))
+        model.use_prior = bool(getattr(args, "use_prior", 0))
+        model.band_margin = float(getattr(args, "band_margin", 1.5))
+        model.prior_weight = float(getattr(args, "prior_weight", 0.0))
+
+        # optional: pass CE width if provided (your model reads it via getattr)
+        if hasattr(args, "gauss_sigma_idx") and args.gauss_sigma_idx is not None:
+            model.gauss_sigma_idx = float(args.gauss_sigma_idx)
 
         form_of_labelling = 'RangePrediction'
     else:

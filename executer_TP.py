@@ -32,6 +32,33 @@ class Execute_TP:
         seed_everything(getattr(args, "seed", 42), workers=True)
         # 1. Create an instance of KG.
         self.args.dataset = Data(args=args)
+
+        # === QUICK SPLIT SANITY ===
+        def _split_stats(name, idx_list, num_times):
+            if not idx_list:
+                print(f"[SANITY] {name}: EMPTY")
+                return
+            import numpy as np
+            X = np.asarray(idx_list, dtype=np.int64)
+            if X.ndim != 2 or X.shape[1] < 5:
+                print(f"[SANITY] {name}: unexpected shape {X.shape} (want Nx5)")
+                return
+            y1 = X[:, 3]; y2 = X[:, 4]
+            n = X.shape[0]
+            bad_lo = (y1 < 0).sum() + (y2 < 0).sum()
+            bad_hi = (y1 >= num_times).sum() + (y2 >= num_times).sum()
+            bad_ord = (y1 > y2).sum()
+            print(f"[SANITY] {name}: n={n}  "
+                  f"y1[min,max]=({y1.min()},{y1.max()})  "
+                  f"y2[min,max]=({y2.min()},{y2.max()})  "
+                  f"out_of_range={bad_lo+bad_hi}  "
+                  f"violations(y1>y2)={bad_ord}")
+
+        _split_stats("train", self.args.dataset.idx_train_set, self.args.dataset.num_times)
+        _split_stats("valid", self.args.dataset.idx_valid_set, self.args.dataset.num_times)
+        _split_stats("test",  self.args.dataset.idx_test_set,  self.args.dataset.num_times)
+
+
         print(f"[DEBUG] idx_time_dict keys: {list(self.args.dataset.idx_time_dict.keys())[:10]}")  # Print first 10 keys
         self.args.idx_time_dict = self.args.dataset.idx_time_dict  # Add this line to store the dictionary
 
@@ -142,6 +169,9 @@ class Execute_TP:
                 gradient_clip_val=1.0,
                 gradient_clip_algorithm="norm",
                 logger=self.args.logger,
+                num_sanity_val_steps=0,
+                benchmark=False,
+                deterministic=False,
             )
         except TypeError:
             # PL ≤ 1.5 fallback
@@ -154,6 +184,9 @@ class Execute_TP:
                 gradient_clip_val=1.0,
                 gradient_clip_algorithm="norm",
                 logger=self.args.logger,
+                num_sanity_val_steps=0,
+                benchmark=False,
+                deterministic=False,
             )
 
         # 2. Check whether validation and test datasets are available.
@@ -169,10 +202,11 @@ class Execute_TP:
     def fit_return_best(self):
         """
         Lightweight training for hyperparameter search.
-        Trains and returns (model, best_val_loss) without running test/eval/store.
+        Trains and returns (model, best_val_softIoU) without running test/eval/store.
         """
-        # 1) Build model and data loaders (same way as in training())
+        # 1) Build model + loaders (unchanged)
         model, form_of_labelling = select_model(self.args)
+        model.gauss_sigma_idx = float(self.args.gauss_sigma_idx)
 
         if not self.args.batch_size:
             self.args.batch_size = int(len(self.args.dataset.idx_train_set) / 3) + 1
@@ -193,27 +227,21 @@ class Execute_TP:
         train_loader = dataset.train_dataloader(batch_size1=self.args.batch_size)
         val_loader = dataset.val_dataloader(batch_size1=self.args.val_batch_size)
 
-        # 2) Minimal callbacks for Optuna
-        ckpt_cb = ModelCheckpoint(
-            monitor="val_loss", mode="min", save_top_k=1,
-            filename="optuna-{epoch:02d}-{val_loss:.4f}"
+        # 2) Optuna-friendly callbacks: checkpoint on IoU (maximize), early-stop on val_loss (minimize)
+        ckpt_cb_iou = ModelCheckpoint(
+            monitor="val_softIoU", mode="max", save_top_k=1,
+            filename="optuna-iou-{epoch:02d}-{val_softIoU:.4f}"
         )
         early_cb = EarlyStopping(monitor="val_loss", mode="min", patience=3)
-        # --- resolve epoch/val-check args robustly (works with either your flags or PL defaults)
-        max_epochs = getattr(self.args, "max_num_epochs", None)
-        if max_epochs is None:
-            max_epochs = getattr(self.args, "max_epochs", 100)
 
-        min_epochs = getattr(self.args, "min_num_epochs", None)
-        if min_epochs is None:
-            min_epochs = getattr(self.args, "min_epochs", 1)
-
+        # 3) Trainer (keeps your compatibility branch)
+        max_epochs = getattr(self.args, "max_num_epochs", getattr(self.args, "max_epochs", 100))
+        min_epochs = getattr(self.args, "min_num_epochs", getattr(self.args, "min_epochs", 1))
         check_val_every_n_epoch = getattr(
             self.args, "check_val_every_n_epoch",
             getattr(self.args, "check_val_every_n_epochs", 1)
         )
 
-        # already computed max_epochs/min_epochs above in that method
         try:
             tuner_trainer = Trainer(
                 accelerator="gpu" if torch.cuda.is_available() else "cpu",
@@ -224,9 +252,9 @@ class Execute_TP:
                 enable_checkpointing=True,
                 logger=False,
                 enable_model_summary=False,
-                callbacks=[ckpt_cb, early_cb],
+                callbacks=[ckpt_cb_iou, early_cb],
                 num_sanity_val_steps=0,
-                deterministic=True,
+                deterministic=False,
             )
         except TypeError:
             tuner_trainer = Trainer(
@@ -234,25 +262,67 @@ class Execute_TP:
                 max_epochs=max_epochs,
                 min_epochs=min_epochs,
                 check_val_every_n_epoch=check_val_every_n_epoch,
-                callbacks=[ckpt_cb, early_cb],
+                callbacks=[ckpt_cb_iou, early_cb],
                 checkpoint_callback=True,
                 logger=False,
                 num_sanity_val_steps=0,
-                deterministic=True,
+                deterministic=False,
             )
 
-        # 4) Fit once and pick the best val
+        # 4) Fit once
         tuner_trainer.fit(model, train_loader, val_loader)
 
-        # 5) Return best val (float). If none, use last val as fallback.
-        if ckpt_cb.best_model_score is not None:
-            best_val = float(ckpt_cb.best_model_score.detach().cpu().item())
+        # 5) Return the **best** IoU seen during training
+        if ckpt_cb_iou.best_model_score is not None:
+            best_iou = float(ckpt_cb_iou.best_model_score.detach().cpu().item())
         else:
-            # fallback: last seen val_loss
-            m = tuner_trainer.callback_metrics.get("val_loss", None)
-            best_val = float(m.detach().cpu().item()) if m is not None else float("inf")
+            # fallback: last epoch's IoU if checkpoint didn’t trigger
+            m = tuner_trainer.callback_metrics.get("val_softIoU", None)
+            best_iou = float(m.detach().cpu().item()) if m is not None else 0.0
 
-        return model, best_val
+        return model, best_iou
+
+    def run_optuna(self):
+        import optuna
+        from optuna.samplers import TPESampler
+        from optuna.pruners import MedianPruner
+
+        # Use CLI limits if provided
+        n_trials = int(getattr(self.args, "optuna_trials", 30) or 30)
+        timeout_s = int(getattr(self.args, "optuna_timeout", 0) or 0)  # 0 = no timeout
+
+        def objective(trial: optuna.Trial):
+            # ---- Suggest ONLY knobs your CLI / model already supports safely ----
+            # (Keeps this simple; we can extend later.)
+            self.args.hidden_dim = trial.suggest_categorical("hidden_dim", [512, 1024])
+            self.args.dropout = trial.suggest_float("dropout", 0.10, 0.18)
+            self.args.emb_noise = trial.suggest_float("emb_noise", 0.00, 0.015)
+            self.args.lr = trial.suggest_float("lr", 1e-3, 2e-3, log=True)
+
+            # existing loss knobs
+            self.args.huber_beta = trial.suggest_float("huber_beta", 0.6, 1.0)
+            self.args.end_weight = trial.suggest_float("end_weight", 0.85, 1.15)
+            self.args.extra_order_pen = trial.suggest_float("extra_order_pen", 0.0, 0.06)
+
+            # simple structural toggles you already have
+            self.args.use_interaction = trial.suggest_categorical("use_interaction", [0, 1])
+            self.args.use_prod = trial.suggest_categorical("use_prod", [0, 1])
+
+            # Fit once, read best val_softIoU
+            _, best_iou = self.fit_return_best()
+            # Optuna maximizes when we return larger numbers directly
+            return best_iou
+
+        study = optuna.create_study(
+            direction="maximize",
+            sampler=TPESampler(seed=int(getattr(self.args, "seed", 42))),
+            pruner=MedianPruner(n_startup_trials=5),
+        )
+        study.optimize(objective, n_trials=n_trials, timeout=timeout_s if timeout_s > 0 else None)
+
+        print("\n[OPTUNA] Best trial:")
+        print("  value (val_softIoU):", study.best_value)
+        print("  params:", study.best_params)
 
     def training(self):
         """
@@ -263,6 +333,8 @@ class Execute_TP:
         print("Loading data")       # my editing for checking where my code gets killed?
 
         model, form_of_labelling = select_model(self.args)
+        # make Optuna/CLI value visible to the model’s training_step
+        model.gauss_sigma_idx = float(self.args.gauss_sigma_idx)
         if not self.args.batch_size:
             self.args.batch_size = int(len(self.args.dataset.idx_train_set) / 3) + 1
         if not self.args.val_batch_size:
@@ -297,6 +369,17 @@ class Execute_TP:
         #batch = next(iter(train_data))
         #print(f"[DEBUG] range batch sampe:", batch)
         val_data = dataset.val_dataloader(batch_size1=self.args.val_batch_size)
+
+        # peek at a tiny batch
+        try:
+            b = next(iter(train_data))
+            h, r, t, y1, y2 = b
+            print(f"[PEEK] train batch shapes: h={h.shape}, r={r.shape}, t={t.shape}, "
+                  f"y1[min,max]=({int(y1.min())},{int(y1.max())}), "
+                  f"y2[min,max]=({int(y2.min())},{int(y2.max())})")
+        except Exception as e:
+            print(f"[PEEK] could not sample a train batch: {e}")
+
 
      #   print(f"Training Data Size: {len(train_data.dataset)}")         # my editing for checking where my code gets killed?
      #   print(f"Validation Data Size: {len(val_data.dataset)}")         # my editing for checking where my code gets killed?
