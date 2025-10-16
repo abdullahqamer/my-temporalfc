@@ -1,211 +1,167 @@
-````markdown
-# TemporalFC — MLP Range Prediction (Thesis Branch)
+# TemporalFC-RangeMLP (MoE Interval Prediction)
 
-This branch contains a **simple, fast MLP** that predicts a **time range** (start year, end year) for a triple **(subject, predicate, object)** from a temporal knowledge graph.
+This repository provides a clean implementation of a **relation-aware MLP (“Range-MLP”) head** for **interval (start–end year) prediction** on knowledge-graph facts.  
+It builds on the original **TemporalFC** codebase.
 
-- **Earlier baseline (before this branch):** MAE ≈ **17.6 / 18.7**, IoU ≈ **0.53**  
-- **Current best (this branch):** MAE ≈ **3.6 / 5.2**, IoU ≈ **0.75** on `wikidata6`
-
-> This branch focuses only on the MLP range predictor (no ElasticSearch/path components).
+- **Task:** Given a triple `(s, p, o)`, predict a validity interval `[y_s, y_e]`.
+- **Highlights:** coupled start–end head, overlap-aware training (soft-IoU auxiliary), frozen Dihedron embeddings, simple MLP trunk.
+- **Default branch:** `MLP`
 
 ---
 
-## 1) Quick Start
+## 1) Setup
 
+### Clone and environment (Conda)
 ```bash
-# clone
-git clone https://github.com/abdullahqamer/my-temporalfc.git
-cd my-temporalfc
+git clone https://github.com/abdullahqamer/TemporalFC-RangeMLP.git
+cd TemporalFC-RangeMLP
 
-# switch to this branch (if not already on it)
-git checkout MLP
-
-# create and activate environment (edit env name if you prefer)
+# create environment (Conda)
 conda env create -f environment.yml
 conda activate tfc
 ````
 
-### Get the dataset & embeddings
+> If you prefer pip, export your own requirements from the environment after it’s created.
 
-Download the release and unzip it into the repo root so it creates `data_TP/...`:
+### Dataset & embeddings
 
-* [https://github.com/abdullahqamer/my-temporalfc/releases/tag/v1.0](https://github.com/abdullahqamer/my-temporalfc/releases/tag/v1.0)
+Download **wikidata6** from Releases and unzip under `data_TP/`:
+
+* **Release:** [https://github.com/abdullahqamer/TemporalFC-RangeMLP/releases/tag/v1.0](https://github.com/abdullahqamer/TemporalFC-RangeMLP/releases/tag/v1.0)
+* **Asset:** `wikidata6.zip`
 
 Expected layout (key parts):
 
 ```
 data_TP/
   wikidata6/
-    train/
-    valid/
-    test/
-    embeddings/      # e.g., dihedron *.npy
+    entities            # or entities_map.tsv (keep one style)
+    relations           # or relations_map.tsv
+    times               # or times_map.tsv
+    embeddings/
+      dihedron/
+        entity.npy  relation.npy  time.npy    # or *.pkl (pick one format)
+    train/train
+    valid/valid
+    test/test
 ```
 
 ---
 
-## 2) Reproducing Thesis Results
-
-### Train the MLP (range prediction)
+## 2) Quick start (1-epoch smoke test)
 
 ```bash
 python main.py \
-  --eval_dataset wikidata6 \
-  --task range-prediction \
-  --model range-mlp \
-  --emb_type dihedron \
+  --path_dataset_folder "./data_TP" \
+  --eval_dataset "wikidata6" \
+  --task "range-prediction" \
+  --model "range-mlp" \
+  --emb_type "dihedron" \
   --embedding_dim 100 \
-  --batch_size 1024 \
-  --val_batch_size 1000 \
-  --use_interaction 1 \
-  --use_prod 1 \
-  --loss_type huber \
+  --batch_size 64 \
+  --val_batch_size 64 \
+  --loss_type "huber" \
   --huber_beta 0.8970321391066037 \
   --end_weight 0.95 \
   --extra_order_pen 0.042741660857969106 \
   --lr 0.00184775182894049 \
-  --num_workers 4 \
-  --max_num_epochs 120 \
+  --num_workers 2 \
+  --max_num_epochs 1 \
+  --min_num_epochs 1 \
+  --check_val_every_n_epochs 1 \
   --seed 42 \
-  --emb_noise 0.02
+  --emb_noise 0.01 \
+  --hidden_dim 1024 \
+  --dropout 0.10
 ```
 
-**Notes**
-
-* `--emb_noise` adds tiny Gaussian noise to entity/relation embeddings **during training only** (helps generalization).
-* A **cosine LR schedule (with a low floor)** and **tiny label jitter** are already handled inside the model code—no extra flags needed.
-* To approximate an older/simpler baseline, you can try `--end_weight 0.86` and `--emb_noise 0.00`.
-
-### Evaluate the best checkpoint
-
-Training stores checkpoints under `dataset/HYBRID_Storage/<timestamp>/...`. Evaluate with:
-
-```bash
-python evaluate_checkpoint_model_TP.py \
-  --checkpoint_dir_folder all \
-  --checkpoint_dataset_folder dataset/ \
-  --eval_dataset wikidata6 \
-  --model range-mlp \
-  --task range-prediction \
-  --emb_type dihedron \
-  --embedding_dim 100
-```
+For full runs, increase `--batch_size`, `--val_batch_size`, and set `--max_num_epochs` (e.g., 120).
 
 ---
 
-## 3) Model Overview (What the MLP does)
+## 3) How it works (aligned with the thesis)
 
-**Input:** a triple **(s, p, o)**
-**Embeddings:**
+**Inputs.** We use frozen **Dihedron** embeddings for entities and relations; simple interactions (e.g., `|h−t|`, `h⊙t`) are concatenated with the base features.
 
-* `h = emb(s)` (subject), `r = emb(p)` (predicate), `t = emb(o)` (object)
+**Trunk + MoE.** A compact MLP trunk feeds a **relation-aware Mixture-of-Experts (MoE)** gate. The gate routes to a small set of experts to capture heterogeneous temporal regimes across relations.
 
-**Interaction features:**
+**Calendar head (coupled start/end).** Over a **shared, trainable calendar embedding table** (years), we score **two distributions**: one for the start year and one for the end year. A **triangular coupling/mask** enforces the constraint **`end ≥ start`** during scoring/normalization, so the two predictions are coherent by construction (no post-hoc swapping).
 
-* absolute difference `|h − t|`
-* elementwise product `h ⊙ t`
+**Training signals.** We combine **smoothed cross-entropy** on the year indices with an **overlap-aware auxiliary (soft-IoU)** so optimization tracks interval quality, not just endpoint sharpness. A light **order/length regularizer** stabilizes the head.
 
-**Concatenate features:**
+**Frozen vs. trainable.** Entity/relation embeddings are **frozen**; the trunk, MoE, and calendar head are trainable.
 
-* `x = [h, r, t, |h − t|, h ⊙ t]`
-
-**MLP trunk (fully-connected stack):**
-
-```
-Linear → GELU → Dropout
-Linear → GELU → Dropout
-Linear → GELU → Dropout
-```
-
-**Head (2 outputs):**
-
-* `Linear(out=2) → [s_raw, d_raw]`
-
-**Map to [0,1] and build a valid interval:**
-
-* `start = σ(s_raw)`
-* `delta = σ(d_raw)`
-* `end   = start + (1 − start) * delta`  (guarantees `end ≥ start` and both in `[0,1]`)
-
-**Training objective:**
-
-* Huber loss on `(start, end)` vs. target years (normalized).
-* Small “order/consistency” penalty to discourage `end < start`.
-
-**Key changes that improved results in this branch:**
-
-* **Label jitter (tiny, training-only):** small noise on target time indices → more robust.
-* **Cosine learning-rate schedule with a low floor:** fast early learning, gentle late refinement.
-* **Slightly higher end weight in the loss:** improves interval quality/IoU.
-* **Tiny embedding noise (training-only):** regularizes embeddings without affecting inference.
+**Evaluation.** Primary metric is **interval IoU**, with **MAE** on start/end reported as diagnostics.
 
 ---
 
-## 4) Directory Structure (relevant parts)
+## 4) Project structure (minimal)
 
 ```
 .
-├── main.py                          # training / validation entrypoint
-├── evaluate_checkpoint_model_TP.py  # evaluation for time-range prediction
+├── main.py                         # CLI runner
+├── executer_TP.py                  # training/eval orchestration
+├── data_TP.py                      # dataset utilities
+├── utils_TP/
+│   ├── static_funcs.py             # model registry, arg checks
+│   └── dataset_classes.py          # DataModule/Dataset
 ├── nn_models_TP/
-│   └── range_mlp_model.py           # MLP architecture & training logic
-├── utils_TP/                        # data utilities, model selection, etc.
-└── data_TP/                         # dataset & embeddings (after download)
+│   ├── base_model.py
+│   └── range_mlp_model.py          # MLP interval head (new)
+├── environment.yml
+└── README.md
 ```
 
 ---
 
-## 5) Tips
+## 5) Repro tips
 
-* Use `--num_workers` to speed up data loading (e.g., 4–8 if your CPU allows).
-* Keep `--seed 42` for exact reproducibility in the thesis runs.
-* If a GPU is available, PyTorch Lightning will use it automatically.
-
----
-
-## 6) Acknowledgements & Related Work
-
-This branch builds on and reuses parts of the original **TemporalFC** codebase and ideas:
-
-* **TemporalFC (ISWC 2023)** — temporal fact checking & time prediction framework.
-  Please cite the original paper from the upstream project.
-
-Embeddings & tooling:
-
-* **Dihedron** temporal KG embeddings (used for entity/relation vectors).
-* **PyTorch** and **PyTorch Lightning** for training infrastructure.
-
-> If you use this branch, please credit the original TemporalFC work and the Dihedron embeddings.
+* Keep `--seed 42` for reproducibility.
+* Use `--num_workers 4–8` to speed up loading (depends on CPU).
+* Only `--model range-mlp` is exposed (legacy LSTM/time-point models removed).
 
 ---
 
-## 7) Citation (TemporalFC)
+## 6) Dataset (Releases)
+
+* **wikidata6 (v1.0):** [https://github.com/abdullahqamer/TemporalFC-RangeMLP/releases/tag/v1.0](https://github.com/abdullahqamer/TemporalFC-RangeMLP/releases/tag/v1.0)
+  Contains ID maps, splits, and Dihedron embeddings needed to run.
+
+---
+
+## 7) Acknowledgements
+
+This work is derived from and inspired by **TemporalFC** (ISWC 2023).
+Original project: [https://github.com/dice-group/TemporalFC](https://github.com/dice-group/TemporalFC)
+Embeddings: **Dihedron** (ESWC 2022).
+
+If you use this repo, please also cite the original works.
+
+**TemporalFC**
 
 ```bibtex
-@inproceedings{10.1007/978-3-031-47240-4_25,
+@inproceedings{Qudus2023TemporalFC,
   title     = {TemporalFC: A Temporal Fact Checking Approach over Knowledge Graphs},
-  author    = {Qudus, Umair and Röder, Michael and Kirrane, Sabrina and Ngomo, Axel-Cyrille Ngonga},
-  booktitle = {The Semantic Web – ISWC 2023},
+  booktitle = {ISWC},
   year      = {2023}
 }
 ```
 
+**Dihedron**
+
 ```bibtex
-@inproceedings{NayyeriVKAWBL22,
-  author    = {Mojtaba Nayyeri and Sahar Vahdati and Md\,Tansen\,Khan and Mirza\,Mohtashim\,Alam and Lisa\,Wenige and Andreas\,Behrend and Jens\,Lehmann},
-  title     = {Dihedron Algebraic Embeddings for Spatio‑Temporal Knowledge Graph Completion},
-  booktitle = {The Semantic Web – 19th International Conference (ESWC 2022), Hersonissos, Crete, Greece, May 29 – June 2, 2022, Proceedings},
-  series    = {Lecture Notes in Computer Science},
-  volume    = {13261},
-  pages     = {253--269},
-  year      = {2022},
-  publisher = {Springer},
-  doi       = {10.1007/978-3-031-06981-9_15}
+@inproceedings{Nayyeri2022Dihedron,
+  title     = {Dihedron Algebraic Embeddings for Spatio-Temporal Knowledge Graph Completion},
+  booktitle = {ESWC},
+  year      = {2022}
 }
-
 ```
 
-```
-::contentReference[oaicite:0]{index=0}
-```
+---
 
+## 8) License
+
+This repository reuses parts of TemporalFC. Please refer to the upstream license and include attribution when publishing results based on this code.
+
+```
+```
