@@ -79,7 +79,7 @@ For full runs, increase `--batch_size`, `--val_batch_size`, and set `--max_num_e
 
 ---
 
-## 3) How it works (aligned with the thesis)
+## 3) How it works
 
 **Inputs.** We use frozen **Dihedron** embeddings for entities and relations; simple interactions (e.g., `|h−t|`, `h⊙t`) are concatenated with the base features.
 
