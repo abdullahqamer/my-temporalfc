@@ -49,6 +49,7 @@ data_TP/
 ---
 
 ## 2) Quick start (1-epoch smoke test)
+Runs end-to-end quickly to verify data paths, loaders, and training loop.
 
 ```bash
 python main.py \
@@ -58,28 +59,61 @@ python main.py \
   --model "range-mlp" \
   --emb_type "dihedron" \
   --embedding_dim 100 \
-  --batch_size 64 \
-  --val_batch_size 64 \
-  --loss_type "huber" \
-  --huber_beta 0.8970321391066037 \
-  --end_weight 0.95 \
-  --extra_order_pen 0.042741660857969106 \
-  --lr 0.00184775182894049 \
+  -batch_size 256 \
+  --val_batch_size 256 \
   --num_workers 2 \
   --max_num_epochs 1 \
   --min_num_epochs 1 \
   --check_val_every_n_epochs 1 \
-  --seed 42 \
-  --emb_noise 0.01 \
-  --hidden_dim 1024 \
-  --dropout 0.10
+  --seed 42
 ```
 
 For full runs, increase `--batch_size`, `--val_batch_size`, and set `--max_num_epochs` (e.g., 120).
 
 ---
 
-## 3) How it works
+## 3) Best-known config
+Use this when you want the strongest numbers.
+
+```bash
+python main.py \
+  --path_dataset_folder "./data_TP" \
+  --eval_dataset "wikidata6" \
+  --task "range-prediction" \
+  --model "range-mlp" \
+  --emb_type "dihedron" \
+  --embedding_dim 100 \
+  --batch_size 1024 \
+  --val_batch_size 1000 \
+  --loss_type "huber" \
+  --huber_beta 0.7366304701152739 \
+  --end_weight 1.0013169655965504 \
+  --extra_order_pen 0.06686696713024719 \
+  --lr 0.0018887997194523478 \
+  --use_interaction 1 \
+  --use_prod 0 \
+  --hidden_dim 1024 \
+  --dropout 0.11699588659730913 \
+  --gauss_sigma_idx 1.3507654810031005 \
+  --emb_noise 0.011450934693677826 \
+  --t_dim 128 \
+  --num_experts 5 \
+  --k_experts 3 \
+  --gate_temp_start 1.4307208041278083 \
+  --gate_balance 0.023266080281596692 \
+  --use_bands 0 \
+  --use_prior 0 \
+  --num_workers 4 \
+  --max_num_epochs 120 \
+  --min_num_epochs 1 \
+  --check_val_every_n_epochs 1 \
+  --seed 42 \
+  --storage_path "HYBRID_Storage"
+```
+
+---
+
+## 4) How it works
 
 **Inputs.** We use frozen **Dihedron** embeddings for entities and relations; simple interactions (e.g., `|h−t|`, `h⊙t`) are concatenated with the base features.
 
@@ -95,7 +129,7 @@ For full runs, increase `--batch_size`, `--val_batch_size`, and set `--max_num_e
 
 ---
 
-## 4) Project structure (minimal)
+## 5) Project structure (minimal)
 
 ```
 .
@@ -114,7 +148,7 @@ For full runs, increase `--batch_size`, `--val_batch_size`, and set `--max_num_e
 
 ---
 
-## 5) Repro tips
+## 6) Repro tips
 
 * Keep `--seed 42` for reproducibility.
 * Use `--num_workers 4–8` to speed up loading (depends on CPU).
@@ -122,14 +156,14 @@ For full runs, increase `--batch_size`, `--val_batch_size`, and set `--max_num_e
 
 ---
 
-## 6) Dataset (Releases)
+## 7) Dataset (Releases)
 
 * **wikidata6 (v1.0):** [https://github.com/abdullahqamer/TemporalFC-RangeMLP/releases/tag/v1.0](https://github.com/abdullahqamer/TemporalFC-RangeMLP/releases/tag/v1.0)
   Contains ID maps, splits, and Dihedron embeddings needed to run.
 
 ---
 
-## 7) Acknowledgements
+## 8) Acknowledgements
 
 This work is derived from and inspired by **TemporalFC** (ISWC 2023).
 Original project: [https://github.com/dice-group/TemporalFC](https://github.com/dice-group/TemporalFC)
@@ -159,7 +193,7 @@ If you use this repo, please also cite the original works.
 
 ---
 
-## 8) License
+## 9) License
 
 This repository reuses parts of TemporalFC. Please refer to the upstream license and include attribution when publishing results based on this code.
 
